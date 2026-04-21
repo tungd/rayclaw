@@ -4,7 +4,9 @@ use tracing::{info, warn};
 
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::embedding::EmbeddingProvider;
-use crate::llm_types::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
+use crate::llm_types::{
+    ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock, ToolDefinition,
+};
 use crate::memory_quality;
 use crate::runtime::AppState;
 use crate::text::floor_char_boundary;
@@ -669,6 +671,7 @@ pub(crate) async fn process_with_agent_impl(
             _ => {}
         }
     }
+    strip_images_for_session(&mut messages);
 
     // If override_prompt is provided (from scheduler), add it as a user message
     if let Some(prompt) = override_prompt {
@@ -789,25 +792,17 @@ pub(crate) async fn process_with_agent_impl(
         return Ok("I didn't receive any message to process.".into());
     }
 
-    // Compact if messages exceed threshold
-    if messages.len() > state.config.max_session_messages {
-        archive_conversation(
-            &state.config.data_dir,
-            context.caller_channel,
-            chat_id,
-            &messages,
-        );
-        messages = compact_messages(
-            state,
-            context.caller_channel,
-            chat_id,
-            &messages,
-            state.config.compact_keep_recent,
-        )
-        .await;
-    }
-
     let tool_defs = state.tools.definitions().to_vec();
+    compact_messages_for_request_budget(
+        state,
+        context.caller_channel,
+        chat_id,
+        &system_prompt,
+        &tool_defs,
+        &mut messages,
+    )
+    .await;
+
     let tool_auth = ToolAuthContext {
         caller_channel: context.caller_channel.to_string(),
         caller_chat_id: chat_id,
@@ -821,6 +816,15 @@ pub(crate) async fn process_with_agent_impl(
     let mut loop_detector = LoopDetector::new(state.config.max_loop_repeats);
     let mut overflow_recovery_attempted = false;
     for iteration in 0..state.config.max_tool_iterations {
+        compact_messages_for_request_budget(
+            state,
+            context.caller_channel,
+            chat_id,
+            &system_prompt,
+            &tool_defs,
+            &mut messages,
+        )
+        .await;
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
                 iteration: iteration + 1,
@@ -1086,7 +1090,7 @@ pub(crate) async fn process_with_agent_impl(
                     }
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: result.content,
+                        content: truncate_tool_result_content(&result.content),
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
@@ -1666,15 +1670,22 @@ pub(crate) fn message_to_text(msg: &Message) -> String {
     }
 }
 
-/// Replace Image content blocks with text placeholders to avoid storing base64 data in sessions.
+/// Replace image blocks with placeholders and trim oversized tool results
+/// so resumable sessions stay within provider request limits.
 pub(crate) fn strip_images_for_session(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
             for block in blocks.iter_mut() {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: "[image was sent]".into(),
-                    };
+                match block {
+                    ContentBlock::Image { .. } => {
+                        *block = ContentBlock::Text {
+                            text: "[image was sent]".into(),
+                        };
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        *content = truncate_tool_result_content(content);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1789,6 +1800,104 @@ async fn recover_from_overflow(
         original_len
     );
     false
+}
+
+const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+const SOFT_LLM_REQUEST_BYTES_LIMIT: usize = 4_500_000;
+
+fn truncate_tool_result_content(content: &str) -> String {
+    if content.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return content.to_string();
+    }
+
+    let head_chars = 18_000usize;
+    let tail_chars = 4_000usize;
+    let total_chars = content.chars().count();
+    let omitted_chars = total_chars.saturating_sub(head_chars + tail_chars);
+
+    let head_end = floor_char_boundary(content, content.char_indices().nth(head_chars).map(|(i, _)| i).unwrap_or(content.len()));
+    let tail_start = content
+        .char_indices()
+        .nth(total_chars.saturating_sub(tail_chars))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let tail_start = floor_char_boundary(content, tail_start);
+
+    format!(
+        "{}\n\n...[tool result truncated, {} chars omitted]...\n\n{}",
+        &content[..head_end],
+        omitted_chars,
+        &content[tail_start..]
+    )
+}
+
+fn approximate_request_body_bytes(
+    system_prompt: &str,
+    messages: &[Message],
+    tool_defs: &[ToolDefinition],
+) -> usize {
+    let messages_bytes = serde_json::to_vec(messages).map(|v| v.len()).unwrap_or_default();
+    let tool_bytes = serde_json::to_vec(tool_defs)
+        .map(|v| v.len())
+        .unwrap_or_default();
+    system_prompt.len() + messages_bytes + tool_bytes + 16_384
+}
+
+async fn compact_messages_for_request_budget(
+    state: &AppState,
+    caller_channel: &str,
+    chat_id: i64,
+    system_prompt: &str,
+    tool_defs: &[ToolDefinition],
+    messages: &mut Vec<Message>,
+) {
+    let mut estimated_bytes = approximate_request_body_bytes(system_prompt, messages, tool_defs);
+    if messages.len() <= state.config.max_session_messages
+        && estimated_bytes <= SOFT_LLM_REQUEST_BYTES_LIMIT
+    {
+        return;
+    }
+
+    info!(
+        "Compacting context for chat_id={} (messages={}, approx_request_bytes={})",
+        chat_id,
+        messages.len(),
+        estimated_bytes
+    );
+    archive_conversation(&state.config.data_dir, caller_channel, chat_id, messages);
+
+    if messages.len() > state.config.max_session_messages {
+        *messages = compact_messages(
+            state,
+            caller_channel,
+            chat_id,
+            messages,
+            state.config.compact_keep_recent,
+        )
+        .await;
+        estimated_bytes = approximate_request_body_bytes(system_prompt, messages, tool_defs);
+    }
+
+    if estimated_bytes > SOFT_LLM_REQUEST_BYTES_LIMIT && messages.len() > 4 {
+        *messages = compact_messages(state, caller_channel, chat_id, messages, 4).await;
+        estimated_bytes = approximate_request_body_bytes(system_prompt, messages, tool_defs);
+    }
+
+    if estimated_bytes > SOFT_LLM_REQUEST_BYTES_LIMIT && messages.len() > 2 {
+        let keep = messages.split_off(messages.len().saturating_sub(2));
+        *messages = keep;
+        if messages.first().map(|m| m.role.as_str()) == Some("assistant") {
+            messages.insert(
+                0,
+                Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "[Context was truncated because the request grew too large.]".into(),
+                    ),
+                },
+            );
+        }
+    }
 }
 
 /// Compact old messages by summarizing them via LLM, keeping recent messages verbatim.
@@ -2712,6 +2821,52 @@ mod tests {
         let a = super::hash_tool_call("read_file", &serde_json::json!({"path": "x"}));
         let b = super::hash_tool_call("read_file", &serde_json::json!({"path": "y"}));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_content_keeps_head_and_tail() {
+        let input = format!("{}{}", "A".repeat(20_000), "B".repeat(20_000));
+        let output = super::truncate_tool_result_content(&input);
+        assert!(output.contains("tool result truncated"));
+        assert!(output.starts_with(&"A".repeat(100)));
+        assert!(output.ends_with(&"B".repeat(100)));
+        assert!(output.len() < input.len());
+    }
+
+    #[test]
+    fn test_strip_images_for_session_trims_tool_results() {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![
+                crate::llm_types::ContentBlock::Image {
+                    source: crate::llm_types::ImageSource {
+                        source_type: "base64".into(),
+                        media_type: "image/png".into(),
+                        data: "abc".into(),
+                    },
+                },
+                crate::llm_types::ContentBlock::ToolResult {
+                    tool_use_id: "tool_1".into(),
+                    content: "X".repeat(40_000),
+                    is_error: None,
+                },
+            ]),
+        }];
+
+        super::strip_images_for_session(&mut messages);
+
+        let MessageContent::Blocks(blocks) = &messages[0].content else {
+            panic!("expected blocks");
+        };
+        assert!(matches!(
+            &blocks[0],
+            crate::llm_types::ContentBlock::Text { text } if text == "[image was sent]"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            crate::llm_types::ContentBlock::ToolResult { content, .. }
+                if content.contains("tool result truncated") && content.len() < 40_000
+        ));
     }
 
     // -----------------------------------------------------------------------

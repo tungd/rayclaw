@@ -6,6 +6,8 @@
 //! MVP scope: Claude Code support only, stdio transport.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -266,6 +268,79 @@ fn build_spawn_command(config: &AcpAgentConfig, workspace: Option<&str>) -> Comm
     cmd
 }
 
+fn resolved_workspace_path(config: &AcpAgentConfig, workspace: Option<&str>) -> Option<PathBuf> {
+    workspace
+        .or(config.workspace.as_deref())
+        .map(expand_home_path)
+}
+
+fn build_shell_fallback_command(config: &AcpAgentConfig, workspace: Option<&str>) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg(&config.command);
+    for arg in &config.args {
+        cmd.arg(arg);
+    }
+    cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+    cmd.env_remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
+    cmd.envs(&config.env);
+
+    if let Some(ws) = resolved_workspace_path(config, workspace) {
+        cmd.current_dir(ws);
+    }
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd
+}
+
+fn spawn_agent_child(
+    agent_name: &str,
+    config: &AcpAgentConfig,
+    workspace: Option<&str>,
+    mode_label: &str,
+) -> Result<Child, String> {
+    if let Some(ws) = resolved_workspace_path(config, workspace) {
+        if !ws.is_dir() {
+            return Err(format!(
+                "Failed to spawn {mode_label} agent '{agent_name}': working directory '{}' does not exist or is not a directory",
+                ws.display()
+            ));
+        }
+    }
+
+    let mut cmd = build_spawn_command(config, workspace);
+    match cmd.spawn() {
+        Ok(child) => Ok(child),
+        Err(primary_err) => {
+            if primary_err.kind() == ErrorKind::NotFound
+                && config.launch == "binary"
+                && Path::new(&config.command).is_file()
+            {
+                warn!(
+                    "{} [{}]: direct spawn of '{}' returned not found; retrying via /bin/sh",
+                    mode_label, agent_name, config.command
+                );
+                let mut fallback = build_shell_fallback_command(config, workspace);
+                match fallback.spawn() {
+                    Ok(child) => return Ok(child),
+                    Err(fallback_err) => {
+                        return Err(format!(
+                            "Failed to spawn {mode_label} agent '{agent_name}': direct exec of '{}' failed ({primary_err}); shell fallback failed ({fallback_err})",
+                            config.command
+                        ));
+                    }
+                }
+            }
+
+            Err(format!(
+                "Failed to spawn {mode_label} agent '{agent_name}': {primary_err}"
+            ))
+        }
+    }
+}
+
 fn expand_home_path(path: &str) -> PathBuf {
     if path == "~" {
         if let Some(home) = std::env::var_os("HOME") {
@@ -389,16 +464,12 @@ impl AcpConnection {
         workspace: Option<&str>,
         request_timeout: Duration,
     ) -> Result<Self, String> {
-        let mut cmd = build_spawn_command(config, workspace);
-
         info!(
             "ACP: spawning agent '{agent_name}' ({} {})",
             config.launch, config.command
         );
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn ACP agent '{agent_name}': {e}"))?;
+        let mut child = spawn_agent_child(agent_name, config, workspace, "ACP")?;
 
         let stdin = child
             .stdin
@@ -1112,16 +1183,12 @@ impl PtyConnection {
         config: &AcpAgentConfig,
         workspace: Option<&str>,
     ) -> Result<Self, String> {
-        let mut cmd = build_spawn_command(config, workspace);
-
         info!(
             "ACP/PTY: spawning agent '{agent_name}' ({} {})",
             config.launch, config.command
         );
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn PTY agent '{agent_name}': {e}"))?;
+        let mut child = spawn_agent_child(agent_name, config, workspace, "PTY")?;
 
         let stdin = child
             .stdin
@@ -1469,6 +1536,22 @@ fn format_progress_batch(events: &mut Vec<String>) -> Option<String> {
     Some(format!("ACP progress update (last 30s):\n{lines}"))
 }
 
+fn agent_buffer_looks_complete(buffer: &str) -> bool {
+    let trimmed = buffer.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.ends_with("\n\n") {
+        return true;
+    }
+
+    matches!(
+        trimmed.chars().last(),
+        Some('.' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '"' | '\'')
+    )
+}
+
 fn spawn_progress_forwarder_with_interval(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
@@ -1478,11 +1561,16 @@ fn spawn_progress_forwarder_with_interval(
     tokio::spawn(async move {
         let mut tool_ticker = tokio::time::interval(flush_interval);
         tool_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut agent_ticker = tokio::time::interval(Duration::from_millis(1200));
-        agent_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let agent_complete_debounce = Duration::from_millis(900);
+        let agent_incomplete_debounce = Duration::from_secs(5);
+        let agent_max_hold = Duration::from_secs(8);
         let mut summary = AcpProgressSummary::default();
         let mut agent_buffer = String::new();
+        let mut agent_buffer_started_at = None::<tokio::time::Instant>;
         let mut tool_events = Vec::<String>::new();
+        let far_future = tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 365);
+        let mut agent_timer = std::pin::Pin::from(Box::new(tokio::time::sleep_until(far_future)));
+        let mut agent_flush_armed = false;
 
         let flush_agent_buffer =
             |buffer: &mut String| -> Option<String> {
@@ -1502,11 +1590,13 @@ fn spawn_progress_forwarder_with_interval(
                         callback(chat_id, text).await;
                     }
                 }
-                _ = agent_ticker.tick() => {
+                _ = &mut agent_timer, if agent_flush_armed => {
                     if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
                         summary.forwarded_agent_text = true;
                         callback(chat_id, text).await;
                     }
+                    agent_buffer_started_at = None;
+                    agent_flush_armed = false;
                 }
                 maybe_event = rx.recv() => match maybe_event {
                     Some(AcpProgressEvent::AgentMessage { text }) => {
@@ -1514,12 +1604,27 @@ fn spawn_progress_forwarder_with_interval(
                             summary.sent_progress_updates = true;
                             callback(chat_id, summary_text).await;
                         }
+                        let now = tokio::time::Instant::now();
+                        let started_at = agent_buffer_started_at.get_or_insert(now);
                         agent_buffer.push_str(&text);
                         if agent_buffer.len() >= 1200 {
                             if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
                                 summary.forwarded_agent_text = true;
                                 callback(chat_id, text).await;
                             }
+                            agent_buffer_started_at = None;
+                            agent_flush_armed = false;
+                        } else {
+                            let quiet_window = if agent_buffer_looks_complete(&agent_buffer) {
+                                agent_complete_debounce
+                            } else {
+                                agent_incomplete_debounce
+                            };
+                            let deadline = std::cmp::min(now + quiet_window, *started_at + agent_max_hold);
+                            agent_timer
+                                .as_mut()
+                                .reset(deadline);
+                            agent_flush_armed = true;
                         }
                     }
                     Some(AcpProgressEvent::ToolStart { name }) => {
@@ -1527,6 +1632,8 @@ fn spawn_progress_forwarder_with_interval(
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
                         }
+                        agent_buffer_started_at = None;
+                        agent_flush_armed = false;
                         tool_events.push(format!("started `{name}`"));
                     }
                     Some(AcpProgressEvent::ToolComplete { name, status }) => {
@@ -1534,7 +1641,15 @@ fn spawn_progress_forwarder_with_interval(
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
                         }
-                        tool_events.push(format!("finished `{name}` with status `{status}`"));
+                        agent_buffer_started_at = None;
+                        agent_flush_armed = false;
+                        if name.starts_with("call_") {
+                            if status != "completed" {
+                                tool_events.push(format!("a tool finished with status `{status}`"));
+                            }
+                        } else {
+                            tool_events.push(format!("finished `{name}` with status `{status}`"));
+                        }
                     }
                     Some(AcpProgressEvent::Thinking { .. }) => {}
                     None => break,
@@ -2018,12 +2133,18 @@ impl AcpManager {
 
     /// List all active sessions.
     pub async fn list_sessions(&self) -> Vec<SessionSummary> {
-        let sessions = self.sessions.read().await;
+        let session_entries: Vec<(String, Arc<Mutex<AcpSession>>)> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .map(|(id, session_mutex)| (id.clone(), Arc::clone(session_mutex)))
+                .collect()
+        };
         let mut summaries = Vec::new();
-        for (id, session_mutex) in sessions.iter() {
+        for (id, session_mutex) in session_entries {
             let session = session_mutex.lock().await;
             summaries.push(SessionSummary {
-                session_id: id.clone(),
+                session_id: id,
                 agent_id: session.agent_id.clone(),
                 workspace: session.workspace.clone(),
                 status: session.status.clone(),
@@ -2284,18 +2405,23 @@ impl AcpManager {
         }
 
         // Collect session IDs that exceed the idle threshold.
-        // We only need a read lock to scan; end_session takes its own write lock.
+        // Clone the session handles first so we never hold the sessions map
+        // lock while awaiting a per-session mutex.
         let mut to_reap: Vec<(String, String)> = Vec::new(); // (session_id, agent_id)
-        {
+        let session_entries: Vec<(String, Arc<Mutex<AcpSession>>)> = {
             let sessions = self.sessions.read().await;
-            for (id, session_mutex) in sessions.iter() {
-                let session = session_mutex.lock().await;
-                if session.status == SessionStatus::Prompting {
-                    continue; // active work — skip
-                }
-                if session.last_activity.elapsed() >= idle_timeout {
-                    to_reap.push((id.clone(), session.agent_id.clone()));
-                }
+            sessions
+                .iter()
+                .map(|(id, session_mutex)| (id.clone(), Arc::clone(session_mutex)))
+                .collect()
+        };
+        for (id, session_mutex) in session_entries {
+            let session = session_mutex.lock().await;
+            if session.status == SessionStatus::Prompting {
+                continue; // active work — skip
+            }
+            if session.last_activity.elapsed() >= idle_timeout {
+                to_reap.push((id, session.agent_id.clone()));
             }
         }
 
@@ -3314,6 +3440,14 @@ mod tests {
         assert!(delivered[0].contains("started `bash`"));
         assert!(delivered[0].contains("finished `bash` with status `success`"));
         assert_eq!(delivered[1], "Part one\nPart two");
+    }
+
+    #[test]
+    fn test_agent_buffer_completion_heuristics() {
+        assert!(!agent_buffer_looks_complete(""));
+        assert!(!agent_buffer_looks_complete("I'm checking the"));
+        assert!(agent_buffer_looks_complete("I'm checking the auth flow."));
+        assert!(agent_buffer_looks_complete("Summary:\n\n"));
     }
 
     #[tokio::test]

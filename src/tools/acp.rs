@@ -1,11 +1,14 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::acp::{AcpManager, AcpProgressSummary, AcpPromptResult, JobCompletionCallback};
-use crate::db::{call_blocking, Database, Memory};
+use crate::db::{call_blocking, Database, Memory, StoredMessage};
 use crate::llm_types::ToolDefinition;
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::json;
 
 use super::{auth_context_from_input, schema_object, Tool, ToolResult};
@@ -147,6 +150,33 @@ impl AcpCodingTool {
         infer_agent_from_memories(chat_id, &context, &memories)
             .unwrap_or_else(|| "claude".to_string())
     }
+
+    async fn resolve_workspace(
+        &self,
+        input: &serde_json::Value,
+        message: &str,
+    ) -> Option<String> {
+        if let Some(workspace) = input.get("workspace").and_then(|v| v.as_str()) {
+            let workspace = workspace.trim();
+            if !workspace.is_empty() {
+                return Some(expand_home_path(workspace).to_string_lossy().to_string());
+            }
+        }
+
+        let Some(chat_id) = auth_context_from_input(input).map(|ctx| ctx.caller_chat_id) else {
+            return None;
+        };
+        let Some(db) = &self.db else {
+            return None;
+        };
+
+        let db = db.clone();
+        let recent = call_blocking(db, move |db| db.get_recent_messages(chat_id, 24))
+            .await
+            .ok()?;
+
+        infer_workspace_from_recent_messages(message, &recent)
+    }
 }
 
 fn infer_agent_from_memories(chat_id: i64, context: &str, memories: &[Memory]) -> Option<String> {
@@ -195,6 +225,96 @@ fn infer_agent_from_memories(chat_id: i64, context: &str, memories: &[Memory]) -
     }
 
     None
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn workspace_candidate_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?P<path>(?:~|/)[^\s`"'<>()]+)"#).expect("workspace regex must compile")
+    })
+}
+
+fn project_root_for_path(candidate: &Path) -> Option<PathBuf> {
+    let existing = if candidate.is_dir() {
+        candidate.to_path_buf()
+    } else if candidate.is_file() {
+        candidate.parent()?.to_path_buf()
+    } else {
+        return None;
+    };
+
+    let mut best: Option<(u8, PathBuf)> = None;
+    for ancestor in existing.ancestors() {
+        let priority = if ancestor.join(".git").exists() {
+            4
+        } else if ancestor.join("pnpm-workspace.yaml").exists() {
+            3
+        } else if ancestor.join("Cargo.toml").exists() || ancestor.join("pyproject.toml").exists()
+        {
+            2
+        } else if ancestor.join("package.json").exists() {
+            1
+        } else {
+            0
+        };
+
+        if priority > 0 {
+            let should_replace = best
+                .as_ref()
+                .map(|(best_priority, _)| priority >= *best_priority)
+                .unwrap_or(true);
+            if should_replace {
+                best = Some((priority, ancestor.to_path_buf()));
+            }
+        }
+    }
+
+    Some(best.map(|(_, path)| path).unwrap_or(existing))
+}
+
+fn normalize_workspace_candidate(raw: &str) -> Option<String> {
+    let cleaned = raw.trim_end_matches(&['.', ',', ';', ':', ')', ']', '}'][..]);
+    let expanded = expand_home_path(cleaned);
+    let workspace = project_root_for_path(&expanded)?;
+    let canonical = workspace.canonicalize().unwrap_or(workspace);
+    Some(canonical.to_string_lossy().to_string())
+}
+
+fn infer_workspace_from_recent_messages(message: &str, recent: &[StoredMessage]) -> Option<String> {
+    for source in std::iter::once(message).chain(recent.iter().rev().map(|m| m.content.as_str())) {
+        for captures in workspace_candidate_regex().captures_iter(source) {
+            let Some(candidate) = captures.name("path") else {
+                continue;
+            };
+            if let Some(workspace) = normalize_workspace_candidate(candidate.as_str()) {
+                return Some(workspace);
+            }
+        }
+    }
+
+    None
+}
+
+fn workspace_matches(requested: Option<&str>, actual: &str) -> bool {
+    let Some(requested) = requested else {
+        return true;
+    };
+    let requested = normalize_workspace_candidate(requested).unwrap_or_else(|| requested.to_string());
+    let actual = normalize_workspace_candidate(actual).unwrap_or_else(|| actual.to_string());
+    requested == actual
 }
 
 #[async_trait]
@@ -256,6 +376,7 @@ impl Tool for AcpCodingTool {
 
         let chat_id = auth_context_from_input(&input).map(|ctx| ctx.caller_chat_id);
         let agent = self.resolve_agent(&input, message).await;
+        let resolved_workspace = self.resolve_workspace(&input, message).await;
 
         // Step 1: Try to reuse existing session for this chat
         let session_id = if let Some(cid) = chat_id {
@@ -264,9 +385,15 @@ impl Tool for AcpCodingTool {
                 // resolved agent for this task.
                 let sessions = self.manager.list_sessions().await;
                 if let Some(summary) = sessions.iter().find(|s| s.session_id == existing) {
-                    if summary.agent_id == agent {
+                    if summary.agent_id == agent
+                        && workspace_matches(
+                            resolved_workspace.as_deref(),
+                            &summary.workspace,
+                        )
+                    {
                         Some(existing)
                     } else {
+                        let _ = self.manager.end_session(&existing).await;
                         self.manager.unbind_chat(cid).await;
                         None
                     }
@@ -303,6 +430,7 @@ impl Tool for AcpCodingTool {
                     .await;
                 }
 
+                let workspace = resolved_workspace.as_deref().or(workspace);
                 match self.manager.new_session(&agent, workspace, None).await {
                     Ok(info) => {
                         if let Some(cid) = chat_id {
@@ -895,6 +1023,17 @@ mod tests {
         }
     }
 
+    fn stored_message(content: &str) -> StoredMessage {
+        StoredMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id: 1,
+            sender_name: "tester".to_string(),
+            content: content.to_string(),
+            is_from_bot: false,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn test_tool_names_unique() {
         let manager = test_manager();
@@ -929,6 +1068,24 @@ mod tests {
         )];
         let agent = infer_agent_from_memories(123, "/users/td/projects/work/bw", &memories);
         assert_eq!(agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn test_infer_workspace_from_recent_messages_prefers_existing_project_path() {
+        let recent = vec![
+            stored_message("Old path: /Users/tungdao/Projects/careai"),
+            stored_message("Current repo is /Users/td/Projects/careai/apps/client-pwa/src"),
+        ];
+        let workspace = infer_workspace_from_recent_messages("Please continue in CareAI", &recent);
+        assert_eq!(workspace.as_deref(), Some("/Users/td/Projects/careai"));
+    }
+
+    #[test]
+    fn test_workspace_matches_normalizes_equivalent_paths() {
+        assert!(workspace_matches(
+            Some("~/Projects/careai/apps/client-pwa"),
+            "/Users/td/Projects/careai"
+        ));
     }
 
     #[test]
