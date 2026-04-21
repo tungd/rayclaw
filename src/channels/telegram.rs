@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, MessageId, ParseMode, ThreadId};
+use teloxide::types::{ChatAction, InputFile, MessageId, ParseMode, ThreadId, Update, UpdateKind};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_engine::{
@@ -50,6 +50,43 @@ fn telegram_conversation_thread_id(
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TelegramDispatchKey {
+    chat_id: i64,
+    conversation_thread_id: Option<i32>,
+}
+
+fn telegram_dispatch_key(
+    chat_id: i64,
+    is_topic_message: bool,
+    thread_id: Option<ThreadId>,
+) -> TelegramDispatchKey {
+    let conversation_thread_id = telegram_conversation_thread_id(is_topic_message, thread_id)
+        .map(|ThreadId(MessageId(thread_id))| thread_id);
+    TelegramDispatchKey {
+        chat_id,
+        conversation_thread_id,
+    }
+}
+
+fn telegram_update_dispatch_key(update: &Update) -> Option<TelegramDispatchKey> {
+    let message = match &update.kind {
+        UpdateKind::Message(message)
+        | UpdateKind::EditedMessage(message)
+        | UpdateKind::ChannelPost(message)
+        | UpdateKind::EditedChannelPost(message)
+        | UpdateKind::BusinessMessage(message)
+        | UpdateKind::EditedBusinessMessage(message) => message,
+        _ => return None,
+    };
+
+    Some(telegram_dispatch_key(
+        message.chat.id.0,
+        message.is_topic_message,
+        message.thread_id,
+    ))
 }
 
 fn format_telegram_external_chat_id(chat_id: i64, thread_id: Option<ThreadId>) -> String {
@@ -247,6 +284,7 @@ pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Resul
     let handler = Update::filter_message().endpoint(handle_message);
 
     Dispatcher::builder(bot, handler)
+        .distribution_function(telegram_update_dispatch_key)
         .default_handler(|_| async {})
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
@@ -1623,6 +1661,23 @@ mod tests {
             telegram_conversation_thread_id(false, general_thread_id),
             None
         );
+    }
+
+    #[test]
+    fn test_telegram_dispatch_key_separates_topics_in_same_supergroup() {
+        let first = telegram_dispatch_key(-1001234567890, true, Some(ThreadId(MessageId(42))));
+        let second = telegram_dispatch_key(-1001234567890, true, Some(ThreadId(MessageId(43))));
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_telegram_dispatch_key_treats_general_topic_as_parent_chat() {
+        let general_topic =
+            telegram_dispatch_key(-1001234567890, false, Some(ThreadId(MessageId(1))));
+        let parent_chat = telegram_dispatch_key(-1001234567890, false, None);
+
+        assert_eq!(general_topic, parent_chat);
     }
 
     #[test]
