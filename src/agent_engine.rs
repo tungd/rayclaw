@@ -1144,7 +1144,7 @@ pub(crate) async fn process_with_agent_impl(
             });
 
             let mut tool_results = Vec::new();
-            let mut loop_detected = false;
+            let mut loop_detected_tool = None;
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
                     if let Some(tx) = event_tx {
@@ -1199,7 +1199,7 @@ pub(crate) async fn process_with_agent_impl(
                         result.error_type.as_deref(),
                         &result.content,
                     ) {
-                        loop_detected = true;
+                        loop_detected_tool = Some(name.clone());
                     }
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -1209,18 +1209,21 @@ pub(crate) async fn process_with_agent_impl(
                 }
             }
 
-            if loop_detected {
+            if let Some(loop_tool_name) = loop_detected_tool {
                 warn!(
-                    "Loop detected after {} iterations (chat_id={}). Forcing stop.",
+                    "Loop detected after {} iterations (chat_id={}, tool={}). Forcing stop.",
                     iteration + 1,
-                    chat_id
+                    chat_id,
+                    loop_tool_name
                 );
                 // Append tool results so the session stays valid, then force stop.
                 messages.push(Message {
                     role: "user".into(),
                     content: MessageContent::Blocks(tool_results),
                 });
-                let loop_msg = "I detected a repeating pattern in my tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps.".to_string();
+                let loop_msg = format!(
+                    "I detected a repeating pattern in my `{loop_tool_name}` tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps."
+                );
                 messages.push(Message {
                     role: "assistant".into(),
                     content: MessageContent::Text(loop_msg.clone()),
@@ -1596,6 +1599,7 @@ You have the following tool categories at your disposal:
 - **Files**: read_file, write_file, edit_file, glob (pattern search), grep (content search)
 - **Memory**: read_memory / write_memory (file-based), structured_read_memory / structured_write_memory (SQLite-backed)
 - **Web**: web_search (DuckDuckGo), web_fetch (fetch and parse URLs)
+- **Browser automation**: agent_browser — local rendered webpage/UI automation via the agent-browser CLI
 - **Messaging**: send_message — push intermediate updates or files mid-conversation
 - **Scheduling**: schedule_task, list_scheduled_tasks, pause/resume/cancel_scheduled_task, get_task_history
 - **Export**: export_chat — dump conversation history to markdown
@@ -1616,6 +1620,11 @@ ACP coding guidance:
 - Prefer `acp_coding` over long sequences of direct `bash`/`read_file` calls when the user wants coding help, debugging, refactors, code review, implementation, or "continue work" in an existing project.
 - If chat memory already captures a preferred coding agent (for example Codex for school/personal or Claude for work), omit the `agent` parameter and let `acp_coding` resolve it from memory.
 - The chat commands `#new`, `#end`, `#agents`, `#sessions`, `#help` are handled by the runtime when the user invokes them directly.
+
+Browser automation guidance:
+- Use `agent_browser` only when you need a real rendered webpage or interactive browser behavior.
+- Prefer `web_fetch` / `web_search` for plain web content retrieval, and prefer `bash`, file tools, or `acp_coding` for repository inspection, CLI checks, APIs, deployments, and coding work.
+- `agent_browser` is RayClaw's local browser tool backed by the `agent-browser` CLI, not a provider-native browsing capability.
 
 # Operational guidelines
 
@@ -2718,6 +2727,8 @@ mod tests {
         assert!(!prompt.contains("<soul>"));
         assert!(prompt.contains("an agentic AI assistant operating across chat channels"));
         assert!(prompt.contains("acp_coding"));
+        assert!(prompt.contains("agent_browser"));
+        assert!(prompt.contains("not a provider-native browsing capability"));
         assert!(prompt.contains("Prefer `acp_coding` over long sequences of direct `bash`/`read_file` calls"));
         assert!(prompt.contains("If a task clearly matches an available skill such as `coding-agent`, load it before proceeding"));
     }
@@ -2949,7 +2960,7 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         for idx in 0..11 {
             assert!(!det.record(
-                "browser",
+                "agent_browser",
                 &serde_json::json!({ "command": format!("step-{idx}") }),
                 false,
                 None,
@@ -2957,7 +2968,7 @@ mod tests {
             ));
         }
         assert!(det.record(
-            "browser",
+            "agent_browser",
             &serde_json::json!({ "command": "step-11" }),
             false,
             None,
@@ -2970,21 +2981,21 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         let input = serde_json::json!({"command": "snapshot -i"});
         assert!(!det.record(
-            "browser",
+            "agent_browser",
             &input,
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
         ));
         assert!(!det.record(
-            "browser",
+            "agent_browser",
             &input,
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
         ));
         assert!(det.record(
-            "browser",
+            "agent_browser",
             &input,
             true,
             Some("process_exit"),

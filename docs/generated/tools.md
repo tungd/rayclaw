@@ -12,8 +12,8 @@ Total built-in tools: **35**
 - `acp_prompt`
 - `acp_submit_job`
 - `activate_skill`
+- `agent_browser`
 - `bash`
-- `browser`
 - `cancel_scheduled_task`
 - `edit_file`
 - `export_chat`

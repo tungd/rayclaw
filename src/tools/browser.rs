@@ -95,13 +95,13 @@ impl BrowserTool {
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
-        "browser"
+        "agent_browser"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "browser".into(),
-            description: "Headless browser automation via agent-browser CLI. Browser state (cookies, localStorage, login sessions) persists across calls and across conversations.\n\n\
+            name: "agent_browser".into(),
+            description: "Local browser automation via the agent-browser CLI for rendered webpages and interactive UI flows. Use this only when you need a real browser to open a page, inspect the rendered DOM, click/fill elements, or capture screenshots/PDFs. Do not use this for repository inspection, shell commands, API checks, or general coding work. This is RayClaw's local browser tool, not a provider-native browser capability. Browser state (cookies, localStorage, login sessions) persists across calls and across conversations.\n\n\
                 ## Basic workflow\n\
                 1. `open <url>` — navigate to a URL\n\
                 2. `snapshot -i` — get interactive elements with refs (@e1, @e2, ...)\n\
@@ -254,10 +254,11 @@ mod tests {
     #[test]
     fn test_browser_tool_name_and_definition() {
         let tool = BrowserTool::new("/tmp/test-data");
-        assert_eq!(tool.name(), "browser");
+        assert_eq!(tool.name(), "agent_browser");
         let def = tool.definition();
-        assert_eq!(def.name, "browser");
+        assert_eq!(def.name, "agent_browser");
         assert!(def.description.contains("agent-browser"));
+        assert!(def.description.contains("not a provider-native browser"));
         assert!(def.description.contains("cookies"));
         assert!(def.description.contains("eval"));
         assert!(def.description.contains("pdf"));
