@@ -96,7 +96,11 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        if name_str == "skills" || name_str == "runtime" || name_str == "mcp.json" {
+        if name_str == "skills"
+            || name_str == "runtime"
+            || name_str == "mcp.json"
+            || name_str == "acp.json"
+        {
             continue;
         }
         let src = entry.path();
@@ -283,4 +287,29 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_legacy_runtime_layout;
+    use std::path::PathBuf;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rayclaw_main_test_{name}_{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn migrate_legacy_runtime_layout_keeps_acp_json_in_data_root() {
+        let data_root = test_dir("acp");
+        let runtime_dir = data_root.join("runtime");
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::write(data_root.join("acp.json"), "{\"acpAgents\":{}}").unwrap();
+
+        migrate_legacy_runtime_layout(&data_root, &runtime_dir);
+
+        assert!(data_root.join("acp.json").exists());
+        assert!(!runtime_dir.join("acp.json").exists());
+
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
 }

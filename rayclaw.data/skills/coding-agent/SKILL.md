@@ -1,6 +1,6 @@
 ---
 name: coding-agent
-description: Delegate coding tasks (refactoring, analysis, debugging, code generation) to an external AI coding agent (Claude Code, Kiro, etc.) via ACP. Use when the user asks you to perform programming tasks that require reading/writing files, running commands, or deep code analysis on the server.
+description: Delegate coding tasks (refactoring, analysis, debugging, code generation) to an external AI coding agent (Codex, Claude Code, Kiro, etc.) via ACP. Use when the user asks you to perform programming tasks that require reading/writing files, running commands, or deep code analysis on the server.
 ---
 
 # Coding Agent Skill
@@ -15,7 +15,12 @@ Use the `acp_coding` tool to delegate coding tasks to an external AI coding agen
 
 ## How to use
 
-Just call `acp_coding` with the task description. That's it.
+Call `acp_coding` with the task description.
+
+If the chat or project already has an agent preference in memory, omit `agent` and let RayClaw choose.
+Only set `agent` explicitly when the user names one or you intentionally need to override the remembered preference.
+
+Prefer absolute workspaces like `/Users/name/project`. Avoid `~/...` paths.
 
 ```
 acp_coding(message="Analyze the project architecture and generate a diagram")
@@ -31,7 +36,7 @@ The tool automatically:
 | Param | Required | Description |
 |-------|----------|-------------|
 | `message` | Yes | The coding task to execute |
-| `agent` | No | Agent name, default "claude". Use "kiro" for Kiro CLI. |
+| `agent` | No | Optional agent override. If omitted, RayClaw chooses from chat memory/context. Use `kiro` for Kiro CLI. |
 | `workspace` | No | Working directory for the agent |
 | `async` | No | Set true for long tasks (> 2 min). Returns job_id, result pushed to chat when done |
 | `timeout_secs` | No | Max wait time in sync mode (default 300) |
@@ -40,6 +45,12 @@ The tool automatically:
 
 ```
 acp_coding(message="List the project directory structure", workspace="/path/to/project")
+```
+
+If the user explicitly asks for Codex:
+
+```
+acp_coding(message="Refactor the payment module and add unit tests", agent="codex", workspace="/path/to/project")
 ```
 
 ### Async mode — for long-running tasks
@@ -53,6 +64,7 @@ Returns job_id immediately. Result is auto-pushed to chat when done.
 ## Tips
 
 - Sessions are automatically reused within the same chat — no need to manage them
+- Reuse only happens for the same agent; changing preferences should start a matching session
 - Sessions auto-expire after 10 minutes of inactivity
 - If the user asks to check a job, use `acp_job_status(job_id=...)`
 - To manually end a session: `acp_end_session(session_id=...)`

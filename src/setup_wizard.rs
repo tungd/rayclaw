@@ -1596,14 +1596,6 @@ fn step_save(values: &HashMap<String, String>) -> Result<Option<String>, RayClaw
     };
     yaml.push_str(&format!("# channels: {}\n\n", channels_note));
 
-    yaml.push_str("# Telegram bot token from @BotFather\n");
-    yaml.push_str(&format!(
-        "telegram_bot_token: \"{}\"\n",
-        get("TELEGRAM_BOT_TOKEN")
-    ));
-    yaml.push_str("# Bot username without @\n");
-    yaml.push_str(&format!("bot_username: \"{}\"\n\n", get("BOT_USERNAME")));
-
     yaml.push_str("# Discord bot token\n");
     let discord_token = get("DISCORD_BOT_TOKEN");
     if discord_token.trim().is_empty() {
@@ -1614,10 +1606,20 @@ fn step_save(values: &HashMap<String, String>) -> Result<Option<String>, RayClaw
 
     yaml.push_str("web_enabled: true\n\n");
 
-    // Dynamic channels
+    // Channel-specific config
+    let telegram_enabled =
+        !get("TELEGRAM_BOT_TOKEN").trim().is_empty() || !get("BOT_USERNAME").trim().is_empty();
     let any_dynamic = dynamic_channel_present.iter().any(|(_, present)| *present);
-    if any_dynamic {
+    if telegram_enabled || any_dynamic {
         yaml.push_str("channels:\n");
+        if telegram_enabled {
+            yaml.push_str("  telegram:\n");
+            yaml.push_str(&format!(
+                "    bot_token: \"{}\"\n",
+                get("TELEGRAM_BOT_TOKEN")
+            ));
+            yaml.push_str(&format!("    bot_username: \"{}\"\n", get("BOT_USERNAME")));
+        }
         for (ch, present) in &dynamic_channel_present {
             if !present {
                 continue;

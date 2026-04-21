@@ -151,6 +151,7 @@ pub async fn create_app_state(
     // Register ACP tools so the model can directly create/prompt/end coding agent sessions.
     for tool in crate::tools::acp::make_acp_tools_with_callback(
         acp_manager.clone(),
+        Some(db.clone()),
         job_callback,
         notify_fn,
     ) {

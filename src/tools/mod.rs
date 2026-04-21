@@ -322,7 +322,11 @@ impl ToolRegistry {
                 config.working_dir_isolation,
             )),
             Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
-            Box::new(memory::WriteMemoryTool::new(&config.data_dir, db.clone())),
+            Box::new(memory::WriteMemoryTool::new(
+                &config.data_dir,
+                db.clone(),
+                config.allow_global_memory_from_any_chat,
+            )),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
             Box::new(send_message::SendMessageTool::new(
@@ -424,7 +428,11 @@ impl ToolRegistry {
                 config.working_dir_isolation,
             )),
             Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
-            Box::new(memory::WriteMemoryTool::new(&config.data_dir, db.clone())),
+            Box::new(memory::WriteMemoryTool::new(
+                &config.data_dir,
+                db.clone(),
+                config.allow_global_memory_from_any_chat,
+            )),
             Box::new(web_fetch::WebFetchTool),
             Box::new(web_search::WebSearchTool),
             Box::new(export_chat::ExportChatTool::new(

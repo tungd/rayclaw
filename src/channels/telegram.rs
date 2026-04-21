@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, ParseMode};
-use tracing::{error, info, warn};
+use teloxide::types::{ChatAction, InputFile, MessageId, ParseMode, ThreadId};
+use tracing::{debug, error, info, warn};
 
 use crate::agent_engine::{
     archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext,
@@ -27,6 +27,82 @@ pub struct TelegramChannelConfig {
     pub bot_username: String,
     #[serde(default)]
     pub allowed_groups: Vec<i64>,
+    #[serde(default = "default_telegram_respond_to_all_messages")]
+    pub respond_to_all_messages: bool,
+}
+
+fn default_telegram_respond_to_all_messages() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelegramTarget {
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+}
+
+fn telegram_conversation_thread_id(
+    is_topic_message: bool,
+    thread_id: Option<ThreadId>,
+) -> Option<ThreadId> {
+    if is_topic_message {
+        thread_id
+    } else {
+        None
+    }
+}
+
+fn format_telegram_external_chat_id(chat_id: i64, thread_id: Option<ThreadId>) -> String {
+    match thread_id {
+        Some(ThreadId(MessageId(thread_id))) => format!("{chat_id}:{thread_id}"),
+        None => chat_id.to_string(),
+    }
+}
+
+fn parse_telegram_external_chat_id(external_chat_id: &str) -> Result<TelegramTarget, String> {
+    let (chat_part, thread_part) = match external_chat_id.rsplit_once(':') {
+        Some((chat_part, thread_part)) if !thread_part.is_empty() => (chat_part, Some(thread_part)),
+        _ => (external_chat_id, None),
+    };
+
+    let chat_id = chat_part
+        .parse::<i64>()
+        .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+    let thread_id = match thread_part {
+        Some(thread_part) => {
+            let thread_id = thread_part
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid Telegram thread id in '{}'", external_chat_id))?;
+            Some(ThreadId(MessageId(thread_id)))
+        }
+        None => None,
+    };
+
+    Ok(TelegramTarget {
+        chat_id: ChatId(chat_id),
+        thread_id,
+    })
+}
+
+fn telegram_runtime_config(state: &AppState) -> TelegramChannelConfig {
+    state
+        .config
+        .channel_config::<TelegramChannelConfig>("telegram")
+        .unwrap_or_else(|| TelegramChannelConfig {
+            bot_token: state.config.telegram_bot_token.clone(),
+            bot_username: state.config.bot_username.clone(),
+            allowed_groups: state.config.allowed_groups.clone(),
+            respond_to_all_messages: false,
+        })
+}
+
+fn should_respond_in_telegram_group(text: &str, config: &TelegramChannelConfig) -> bool {
+    if config.respond_to_all_messages {
+        return true;
+    }
+
+    let bot_username = config.bot_username.trim().trim_start_matches('@');
+    !bot_username.is_empty() && text.contains(&format!("@{bot_username}"))
 }
 
 pub struct TelegramAdapter {
@@ -96,10 +172,8 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
-        send_response(&self.bot, ChatId(telegram_chat_id), text).await;
+        let target = parse_telegram_external_chat_id(external_chat_id)?;
+        send_response(&self.bot, target.chat_id, target.thread_id, text).await;
         Ok(())
     }
 
@@ -109,16 +183,17 @@ impl ChannelAdapter for TelegramAdapter {
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<String, String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+        let target = parse_telegram_external_chat_id(external_chat_id)?;
 
         let (caption_for_attachment, overflow_text) = Self::split_telegram_caption(caption);
 
         if Self::is_likely_image(file_path) {
             let mut req = self
                 .bot
-                .send_photo(ChatId(telegram_chat_id), InputFile::file(file_path));
+                .send_photo(target.chat_id, InputFile::file(file_path));
+            if let Some(thread_id) = target.thread_id {
+                req = req.message_thread_id(thread_id);
+            }
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
@@ -127,7 +202,10 @@ impl ChannelAdapter for TelegramAdapter {
         } else {
             let mut req = self
                 .bot
-                .send_document(ChatId(telegram_chat_id), InputFile::file(file_path));
+                .send_document(target.chat_id, InputFile::file(file_path));
+            if let Some(thread_id) = target.thread_id {
+                req = req.message_thread_id(thread_id);
+            }
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
@@ -136,7 +214,7 @@ impl ChannelAdapter for TelegramAdapter {
         }
 
         if let Some(extra) = overflow_text {
-            send_response(&self.bot, ChatId(telegram_chat_id), &extra).await;
+            send_response(&self.bot, target.chat_id, target.thread_id, &extra).await;
         }
 
         Ok(match caption {
@@ -184,6 +262,16 @@ async fn handle_message(
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let raw_chat_id = msg.chat.id.0;
+    let conversation_thread_id =
+        telegram_conversation_thread_id(msg.is_topic_message, msg.thread_id);
+    let reply_target = TelegramTarget {
+        chat_id: msg.chat.id,
+        thread_id: conversation_thread_id,
+    };
+    let typing_target = TelegramTarget {
+        chat_id: msg.chat.id,
+        thread_id: msg.thread_id,
+    };
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
         teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
@@ -200,6 +288,16 @@ async fn handle_message(
         }) => ("group", "telegram_channel"),
     };
     let chat_title = msg.chat.title().map(|t| t.to_string());
+    let external_chat_id = format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
+    let telegram_cfg = telegram_runtime_config(&state);
+    debug!(
+        "Telegram routing chat_id={} raw_thread_id={:?} is_topic_message={} conversation_thread_id={:?} typing_thread_id={:?}",
+        raw_chat_id,
+        msg.thread_id,
+        msg.is_topic_message,
+        conversation_thread_id,
+        typing_target.thread_id
+    );
 
     // Extract content: text, photo, or voice
     let mut text = msg.text().unwrap_or("").to_string();
@@ -208,7 +306,7 @@ async fn handle_message(
 
     // Handle /reset command — clear session
     if text.trim() == "/reset" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = external_chat_id.clone();
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -222,22 +320,32 @@ async fn handle_message(
         .await
         .unwrap_or(raw_chat_id);
         let _ = call_blocking(state.db.clone(), move |db| db.clear_chat_context(chat_id)).await;
-        let _ = bot
-            .send_message(msg.chat.id, "Context cleared (session + chat history).")
-            .await;
+        send_response(
+            &bot,
+            reply_target.chat_id,
+            reply_target.thread_id,
+            "Context cleared (session + chat history).",
+        )
+        .await;
         return Ok(());
     }
 
     // Handle /skills command — list available skills
     if text.trim() == "/skills" {
         let formatted = state.skills.list_skills_formatted();
-        let _ = bot.send_message(msg.chat.id, formatted).await;
+        send_response(
+            &bot,
+            reply_target.chat_id,
+            reply_target.thread_id,
+            &formatted,
+        )
+        .await;
         return Ok(());
     }
 
     // Handle /archive command — archive current session to markdown
     if text.trim() == "/archive" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = external_chat_id.clone();
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -255,29 +363,33 @@ async fn handle_message(
         {
             let messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
             if messages.is_empty() {
-                let _ = bot
-                    .send_message(msg.chat.id, "No session to archive.")
-                    .await;
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    "No session to archive.",
+                )
+                .await;
             } else {
                 archive_conversation(&state.config.data_dir, "telegram", chat_id, &messages);
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Archived {} messages.", messages.len()),
-                    )
-                    .await;
+                let reply = format!("Archived {} messages.", messages.len());
+                send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
             }
         } else {
-            let _ = bot
-                .send_message(msg.chat.id, "No session to archive.")
-                .await;
+            send_response(
+                &bot,
+                reply_target.chat_id,
+                reply_target.thread_id,
+                "No session to archive.",
+            )
+            .await;
         }
         return Ok(());
     }
 
     // Handle /usage command — token usage summary
     if text.trim() == "/usage" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = external_chat_id.clone();
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -292,15 +404,17 @@ async fn handle_message(
         .unwrap_or(raw_chat_id);
         match build_usage_report(state.db.clone(), &state.config, chat_id).await {
             Ok(response) => {
-                let _ = bot.send_message(msg.chat.id, response).await;
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    &response,
+                )
+                .await;
             }
             Err(e) => {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Failed to query usage statistics: {e}"),
-                    )
-                    .await;
+                let reply = format!("Failed to query usage statistics: {e}");
+                send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
             }
         }
         return Ok(());
@@ -335,15 +449,11 @@ async fn handle_message(
             .saturating_mul(1024);
         let doc_bytes = u64::from(document.file.size);
         if doc_bytes > max_bytes {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    format!(
-                        "Document is too large ({} bytes). Max allowed is {} MB.",
-                        doc_bytes, state.config.max_document_size_mb
-                    ),
-                )
-                .await;
+            let reply = format!(
+                "Document is too large ({} bytes). Max allowed is {} MB.",
+                doc_bytes, state.config.max_document_size_mb
+            );
+            send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
             return Ok(());
         }
 
@@ -446,12 +556,13 @@ async fn handle_message(
                 }
             }
         } else {
-            let _ = bot
-                .send_message(
-                    msg.chat.id,
-                    "Voice messages not supported (no Whisper API key configured)",
-                )
-                .await;
+            send_response(
+                &bot,
+                reply_target.chat_id,
+                reply_target.thread_id,
+                "Voice messages not supported (no Whisper API key configured)",
+            )
+            .await;
             return Ok(());
         }
     }
@@ -468,10 +579,10 @@ async fn handle_message(
 
     // Check group allowlist
     if (db_chat_type == "telegram_group" || db_chat_type == "telegram_supergroup")
-        && !state.config.allowed_groups.is_empty()
-        && !state.config.allowed_groups.contains(&raw_chat_id)
+        && !telegram_cfg.allowed_groups.is_empty()
+        && !telegram_cfg.allowed_groups.contains(&raw_chat_id)
     {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = external_chat_id.clone();
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -521,7 +632,7 @@ async fn handle_message(
         return Ok(());
     }
 
-    let external_chat_id = raw_chat_id.to_string();
+    let external_chat_id = external_chat_id.clone();
     let chat_title_for_lookup = chat_title.clone();
     let chat_type_for_lookup = db_chat_type.to_string();
     let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -574,10 +685,7 @@ async fn handle_message(
     // Determine if we should respond
     let should_respond = match runtime_chat_type {
         "private" => true,
-        _ => {
-            let bot_mention = format!("@{}", state.config.bot_username);
-            text.contains(&bot_mention)
-        }
+        _ => should_respond_in_telegram_group(&text, &telegram_cfg),
     };
 
     if !should_respond {
@@ -592,13 +700,28 @@ async fn handle_message(
     );
 
     // Start continuous typing indicator
-    let typing_chat_id = msg.chat.id;
     let typing_bot = bot.clone();
     let typing_handle = tokio::spawn(async move {
         loop {
-            let _ = typing_bot
-                .send_chat_action(typing_chat_id, ChatAction::Typing)
-                .await;
+            let mut req = typing_bot.send_chat_action(typing_target.chat_id, ChatAction::Typing);
+            if let Some(thread_id) = typing_target.thread_id {
+                req = req.message_thread_id(thread_id);
+            }
+            debug!(
+                "Sending Telegram typing indicator for {} thread {:?}",
+                typing_target.chat_id.0, typing_target.thread_id
+            );
+            if let Err(err) = req.await {
+                warn!(
+                    "Telegram typing indicator failed for {} thread {:?}: {err}",
+                    typing_target.chat_id.0, typing_target.thread_id
+                );
+            } else {
+                debug!(
+                    "Telegram typing indicator sent for {} thread {:?}",
+                    typing_target.chat_id.0, typing_target.thread_id
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         }
     });
@@ -631,7 +754,13 @@ async fn handle_message(
             }
 
             if !response.is_empty() {
-                send_response(&bot, msg.chat.id, &response).await;
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    &response,
+                )
+                .await;
 
                 // Store bot response
                 let bot_msg = StoredMessage {
@@ -652,7 +781,13 @@ async fn handle_message(
                 );
             } else {
                 let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
-                send_response(&bot, msg.chat.id, &fallback).await;
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    &fallback,
+                )
+                .await;
                 let bot_msg = StoredMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     chat_id,
@@ -667,7 +802,8 @@ async fn handle_message(
         Err(e) => {
             typing_handle.abort();
             error!("Error processing message: {}", e);
-            let _ = bot.send_message(msg.chat.id, format!("Error: {e}")).await;
+            let reply = format!("Error: {e}");
+            send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
         }
     }
 
@@ -856,22 +992,32 @@ fn render_markdown_v2_safe(text: &str) -> String {
     out
 }
 
-async fn send_telegram_markdown_or_plain(bot: &Bot, chat_id: ChatId, text: &str) {
+async fn send_telegram_markdown_or_plain(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+    text: &str,
+) {
     let markdown_text = render_markdown_v2_safe(text);
-    let markdown = bot
-        .send_message(chat_id, markdown_text)
-        .parse_mode(ParseMode::MarkdownV2)
-        .await;
+    let mut req = bot.send_message(chat_id, markdown_text);
+    if let Some(thread_id) = thread_id {
+        req = req.message_thread_id(thread_id);
+    }
+    let markdown = req.parse_mode(ParseMode::MarkdownV2).await;
 
     if let Err(err) = markdown {
         warn!("Telegram MarkdownV2 send failed, falling back to plain text: {err}");
-        let _ = bot.send_message(chat_id, text).await;
+        let mut fallback_req = bot.send_message(chat_id, text);
+        if let Some(thread_id) = thread_id {
+            fallback_req = fallback_req.message_thread_id(thread_id);
+        }
+        let _ = fallback_req.await;
     }
 }
 
-pub async fn send_response(bot: &Bot, chat_id: ChatId, text: &str) {
+pub async fn send_response(bot: &Bot, chat_id: ChatId, thread_id: Option<ThreadId>, text: &str) {
     for chunk in split_response_text(text) {
-        send_telegram_markdown_or_plain(bot, chat_id, &chunk).await;
+        send_telegram_markdown_or_plain(bot, chat_id, thread_id, &chunk).await;
     }
 }
 
@@ -1431,6 +1577,75 @@ mod tests {
             format_user_message("", "hi"),
             "<user_message sender=\"\">hi</user_message>"
         );
+    }
+
+    #[test]
+    fn test_format_and_parse_telegram_external_chat_id_without_thread() {
+        let external_chat_id = format_telegram_external_chat_id(-1001234567890, None);
+        assert_eq!(external_chat_id, "-1001234567890");
+
+        let target = parse_telegram_external_chat_id(&external_chat_id).unwrap();
+        assert_eq!(
+            target,
+            TelegramTarget {
+                chat_id: ChatId(-1001234567890),
+                thread_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_and_parse_telegram_external_chat_id_with_thread() {
+        let external_chat_id =
+            format_telegram_external_chat_id(-1001234567890, Some(ThreadId(MessageId(42))));
+        assert_eq!(external_chat_id, "-1001234567890:42");
+
+        let target = parse_telegram_external_chat_id(&external_chat_id).unwrap();
+        assert_eq!(
+            target,
+            TelegramTarget {
+                chat_id: ChatId(-1001234567890),
+                thread_id: Some(ThreadId(MessageId(42))),
+            }
+        );
+    }
+
+    #[test]
+    fn test_telegram_conversation_thread_id_keeps_regular_topic_thread() {
+        let thread_id = Some(ThreadId(MessageId(42)));
+        assert_eq!(telegram_conversation_thread_id(true, thread_id), thread_id);
+    }
+
+    #[test]
+    fn test_telegram_conversation_thread_id_ignores_general_topic_thread_for_chat_identity() {
+        let general_thread_id = Some(ThreadId(MessageId(1)));
+        assert_eq!(
+            telegram_conversation_thread_id(false, general_thread_id),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_respond_in_telegram_group_when_reply_all_enabled() {
+        let config = TelegramChannelConfig {
+            bot_token: "tok".into(),
+            bot_username: String::new(),
+            allowed_groups: vec![],
+            respond_to_all_messages: true,
+        };
+        assert!(should_respond_in_telegram_group("hello", &config));
+    }
+
+    #[test]
+    fn test_should_respond_in_telegram_group_when_mentioned() {
+        let config = TelegramChannelConfig {
+            bot_token: "tok".into(),
+            bot_username: "raybot".into(),
+            allowed_groups: vec![],
+            respond_to_all_messages: false,
+        };
+        assert!(should_respond_in_telegram_group("hi @raybot", &config));
+        assert!(!should_respond_in_telegram_group("hi there", &config));
     }
 
     #[test]

@@ -110,6 +110,31 @@ const MODEL_OPTIONS: Record<string, string[]> = {
   google: ['gemini-2.5-pro', 'gemini-2.5-flash'],
 }
 
+const DEFAULT_LLM_BASE_URLS: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  openrouter: 'https://openrouter.ai/api/v1',
+  ollama: 'http://127.0.0.1:11434/v1',
+  google: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  alibaba: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  deepseek: 'https://api.deepseek.com/v1',
+  moonshot: 'https://api.moonshot.cn/v1',
+  mistral: 'https://api.mistral.ai/v1',
+  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
+  minimax: 'https://api.minimax.io/v1',
+  cohere: 'https://api.cohere.ai/compatibility/v1',
+  tencent: 'https://api.hunyuan.cloud.tencent.com/v1',
+  xai: 'https://api.x.ai/v1',
+  huggingface: 'https://router.huggingface.co/v1',
+  together: 'https://api.together.xyz/v1',
+}
+
+const BASE_URL_PLACEHOLDERS: Record<string, string> = {
+  anthropic: 'https://api.anthropic.com',
+  azure: 'https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT',
+  custom: 'https://api.example.com/v1',
+  ...DEFAULT_LLM_BASE_URLS,
+}
+
 const DEFAULT_CONFIG_VALUES = {
   llm_provider: 'anthropic',
   working_dir_isolation: 'chat',
@@ -206,6 +231,21 @@ function defaultModelForProvider(providerRaw: string): string {
   if (provider === 'openai-codex') return 'gpt-5.3-codex'
   if (provider === 'ollama') return 'llama3.2'
   return 'gpt-5.2'
+}
+
+function defaultBaseUrlForProvider(providerRaw: string): string {
+  const provider = providerRaw.trim().toLowerCase()
+  return DEFAULT_LLM_BASE_URLS[provider] || ''
+}
+
+function suggestedBaseUrlForProvider(providerRaw: string): string {
+  const provider = providerRaw.trim().toLowerCase()
+  return BASE_URL_PLACEHOLDERS[provider] || 'https://api.example.com/v1'
+}
+
+function providerAllowsBaseUrl(providerRaw: string): boolean {
+  const provider = providerRaw.trim().toLowerCase()
+  return provider !== 'openai-codex' && provider !== 'bedrock'
 }
 
 function readAppearance(): Appearance {
@@ -1045,7 +1085,28 @@ function App() {
   }
 
   function setConfigField(field: string, value: unknown): void {
-    setConfigDraft((prev) => ({ ...prev, [field]: value }))
+    setConfigDraft((prev) => {
+      if (field !== 'llm_provider') {
+        return { ...prev, [field]: value }
+      }
+
+      const nextProvider = String(value || '').trim().toLowerCase()
+      const prevProvider = String(prev.llm_provider || '').trim().toLowerCase()
+      const prevBaseUrl = String(prev.llm_base_url || '').trim()
+      const prevDefaultBase = defaultBaseUrlForProvider(prevProvider)
+      const nextDefaultBase = defaultBaseUrlForProvider(nextProvider)
+      const shouldReplaceBaseUrl = !prevBaseUrl || prevBaseUrl === prevDefaultBase
+      const nextBaseUrl = providerAllowsBaseUrl(nextProvider)
+        ? (shouldReplaceBaseUrl ? nextDefaultBase : prevBaseUrl)
+        : ''
+
+      return {
+        ...prev,
+        llm_provider: value,
+        model: defaultModelForProvider(nextProvider),
+        llm_base_url: nextBaseUrl,
+      }
+    })
   }
 
   function resetConfigField(field: string): void {
@@ -1055,6 +1116,7 @@ function App() {
         case 'llm_provider':
           next.llm_provider = DEFAULT_CONFIG_VALUES.llm_provider
           next.model = defaultModelForProvider(DEFAULT_CONFIG_VALUES.llm_provider)
+          next.llm_base_url = defaultBaseUrlForProvider(DEFAULT_CONFIG_VALUES.llm_provider)
           break
         case 'model':
           next.model = defaultModelForProvider(String(next.llm_provider || DEFAULT_CONFIG_VALUES.llm_provider))
@@ -1141,14 +1203,6 @@ function App() {
   async function saveConfigChanges(): Promise<void> {
     try {
       const provider = String(configDraft.llm_provider || '').trim().toLowerCase()
-      if (provider === 'openai-codex') {
-        const apiKey = String(configDraft.api_key || '').trim()
-        const baseUrl = String(configDraft.llm_base_url || '').trim()
-        if (apiKey || baseUrl) {
-          setSaveStatus('Save failed: openai-codex ignores api_key/llm_base_url in rayclaw config. Configure ~/.codex/auth.json and ~/.codex/config.toml.')
-          return
-        }
-      }
 
       const payload: Record<string, unknown> = {
         llm_provider: String(configDraft.llm_provider || ''),
@@ -1179,9 +1233,13 @@ function App() {
           ? Number(configDraft.embedding_dim)
           : null,
       }
-      if (String(configDraft.llm_provider || '').trim().toLowerCase() === 'custom') {
-        payload.llm_base_url = String(configDraft.llm_base_url || '').trim() || null
-      } else if (provider === 'openai-codex') {
+      const baseUrl = String(configDraft.llm_base_url || '').trim()
+      const effectiveBaseUrl = baseUrl || defaultBaseUrlForProvider(provider)
+      if (provider === 'openai-codex') {
+        payload.llm_base_url = null
+      } else if (providerAllowsBaseUrl(provider)) {
+        payload.llm_base_url = effectiveBaseUrl || null
+      } else {
         payload.llm_base_url = null
       }
       const apiKey = String(configDraft.api_key || '').trim()
@@ -1468,7 +1526,7 @@ function App() {
                                 LLM provider and API settings.
                               </Text>
                               <Text size="1" color="gray" className="mt-2 block">llm_provider selects routing preset; model is the exact model id sent to provider API.</Text>
-                              <Text size="1" color="gray" className="mt-1 block">For custom providers set <code>llm_base_url</code>. For <code>openai-codex</code>, configure auth/provider in <code>~/.codex/auth.json</code> and <code>~/.codex/config.toml</code> (this form ignores <code>api_key</code>/<code>llm_base_url</code>). <code>ollama</code> can leave <code>api_key</code> empty.</Text>
+                              <Text size="1" color="gray" className="mt-1 block">Preset providers use a default base URL when left blank. For <code>openai-codex</code>, configure auth/provider in <code>~/.codex/auth.json</code> and <code>~/.codex/config.toml</code> instead. <code>ollama</code> can leave <code>api_key</code> empty.</Text>
                               <div className="mt-4 space-y-3">
                                 <ConfigFieldCard label="llm_provider" description={<>Select provider preset for request routing and defaults.</>}>
                                   <div className="mt-2">
@@ -1500,14 +1558,28 @@ function App() {
                                   ) : null}
                                 </ConfigFieldCard>
 
-                                {currentProvider === 'custom' ? (
-                                  <ConfigFieldCard label="llm_base_url" description={<>Base URL for OpenAI-compatible custom provider endpoint.</>}>
+                                {providerAllowsBaseUrl(currentProvider) ? (
+                                  <ConfigFieldCard
+                                    label="llm_base_url"
+                                    description={
+                                      currentProvider === 'custom'
+                                        ? <>Base URL for your OpenAI-compatible custom provider endpoint.</>
+                                        : currentProvider === 'azure'
+                                          ? <>Required for Azure deployments. Preset providers use their default endpoint when this is blank.</>
+                                          : <>Optional endpoint override. Leave blank to use the preset default for this provider.</>
+                                    }
+                                  >
                                     <TextField.Root
                                       className="mt-2"
                                       value={String(configDraft.llm_base_url || '')}
                                       onChange={(e) => setConfigField('llm_base_url', e.target.value)}
-                                      placeholder="https://api.example.com/v1"
+                                      placeholder={suggestedBaseUrlForProvider(currentProvider)}
                                     />
+                                    {defaultBaseUrlForProvider(currentProvider) ? (
+                                      <Text size="1" color="gray" className="mt-2 block">
+                                        Blank uses <code>{defaultBaseUrlForProvider(currentProvider)}</code>.
+                                      </Text>
+                                    ) : null}
                                 </ConfigFieldCard>
                                 ) : null}
 

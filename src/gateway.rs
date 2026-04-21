@@ -406,6 +406,9 @@ fn render_linux_unit(ctx: &ServiceContext, name: &str) -> String {
             config_path.display()
         ));
     }
+    for (key, value) in service_passthrough_env_vars() {
+        unit.push_str(&format!("Environment={}={}\n", key, value));
+    }
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=5\n\n");
     unit.push_str("[Install]\n");
@@ -565,6 +568,10 @@ fn render_macos_plist(ctx: &ServiceContext, name: &str) -> String {
             xml_escape(&config_path.to_string_lossy())
         ));
     }
+    for (key, value) in service_passthrough_env_vars() {
+        items.push(format!("    <key>{}</key>", xml_escape(&key)));
+        items.push(format!("    <string>{}</string>", xml_escape(&value)));
+    }
     items.push("  </dict>".to_string());
 
     items.push("</dict>".to_string());
@@ -579,6 +586,18 @@ fn xml_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('\"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn service_passthrough_env_vars() -> Vec<(String, String)> {
+    ["RUST_LOG", "RUST_BACKTRACE"]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
 }
 
 fn mac_target_label(name: &str) -> Result<String> {

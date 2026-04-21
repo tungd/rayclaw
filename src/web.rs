@@ -1701,6 +1701,7 @@ async fn api_acp_prompt(
             "ok": true,
             "completed": result.completed,
             "messages": result.messages,
+            "tool_outputs": result.tool_outputs,
             "tool_calls": result.tool_calls.iter().map(|tc| json!({
                 "name": tc.name,
                 "input": tc.input,
@@ -1768,6 +1769,7 @@ async fn api_acp_prompt_stream(
                     "ok": true,
                     "completed": result.completed,
                     "messages": result.messages,
+                    "tool_outputs": result.tool_outputs,
                     "tool_calls": result.tool_calls.iter().map(|tc| json!({
                         "name": tc.name,
                         "input": tc.input,
@@ -1824,6 +1826,7 @@ async fn api_acp_submit_job(
             &body.session_id,
             &body.message,
             body.timeout_secs,
+            None,
             None,
             None,
         )
@@ -2230,6 +2233,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,

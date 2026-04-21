@@ -66,6 +66,9 @@ fn default_compact_keep_recent() -> usize {
 fn default_control_chat_ids() -> Vec<i64> {
     Vec::new()
 }
+fn default_allow_global_memory_from_any_chat() -> bool {
+    false
+}
 fn default_web_enabled() -> bool {
     true
 }
@@ -173,6 +176,8 @@ pub struct Config {
     pub timezone: String,
     #[serde(default = "default_control_chat_ids")]
     pub control_chat_ids: Vec<i64>,
+    #[serde(default = "default_allow_global_memory_from_any_chat")]
+    pub allow_global_memory_from_any_chat: bool,
 
     // --- Web UI ---
     #[serde(default = "default_web_enabled")]
@@ -492,19 +497,22 @@ impl Config {
     pub(crate) fn post_deserialize(&mut self) -> Result<(), RayClawError> {
         self.normalize_fields()?;
 
-        // Synthesize `channels` map from legacy flat fields if empty
-        if self.channels.is_empty() {
-            if !self.telegram_bot_token.trim().is_empty() {
-                self.channels.insert(
-                    "telegram".into(),
-                    serde_yaml::to_value(serde_json::json!({
-                        "bot_token": self.telegram_bot_token,
-                        "bot_username": self.bot_username,
-                        "allowed_groups": self.allowed_groups,
-                    }))
-                    .unwrap(),
-                );
-            }
+        // Synthesize per-channel entries from legacy flat fields only when the new
+        // `channels.<name>` block is missing. This keeps old configs working while
+        // making the channel registry the single runtime source of truth.
+        if !self.channels.contains_key("telegram") && !self.telegram_bot_token.trim().is_empty() {
+            self.channels.insert(
+                "telegram".into(),
+                serde_yaml::to_value(serde_json::json!({
+                    "bot_token": self.telegram_bot_token,
+                    "bot_username": self.bot_username,
+                    "allowed_groups": self.allowed_groups,
+                    "respond_to_all_messages": false,
+                }))
+                .unwrap(),
+            );
+        }
+        if !self.channels.contains_key("discord") {
             if let Some(ref token) = self.discord_bot_token {
                 if !token.trim().is_empty() {
                     self.channels.insert(
@@ -517,18 +525,18 @@ impl Config {
                     );
                 }
             }
-            if self.web_enabled {
-                self.channels.insert(
-                    "web".into(),
-                    serde_yaml::to_value(serde_json::json!({
-                        "enabled": true,
-                        "host": self.web_host,
-                        "port": self.web_port,
-                        "auth_token": self.web_auth_token,
-                    }))
-                    .unwrap(),
-                );
-            }
+        }
+        if !self.channels.contains_key("web") && self.web_enabled {
+            self.channels.insert(
+                "web".into(),
+                serde_yaml::to_value(serde_json::json!({
+                    "enabled": true,
+                    "host": self.web_host,
+                    "port": self.web_port,
+                    "auth_token": self.web_auth_token,
+                }))
+                .unwrap(),
+            );
         }
 
         // Validate required fields
@@ -630,6 +638,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -678,6 +687,7 @@ mod tests {
         assert_eq!(cloned.timezone, "UTC");
         assert!(cloned.allowed_groups.is_empty());
         assert!(cloned.control_chat_ids.is_empty());
+        assert!(!cloned.allow_global_memory_from_any_chat);
         assert_eq!(cloned.max_session_messages, 40);
         assert_eq!(cloned.compact_keep_recent, 20);
         assert!(cloned.discord_bot_token.is_none());
@@ -774,6 +784,65 @@ mod tests {
         config.post_deserialize().unwrap();
         assert_eq!(config.llm_provider, "anthropic");
         assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn test_post_deserialize_backfills_missing_telegram_channel() {
+        #[derive(Deserialize)]
+        struct TelegramConfigView {
+            bot_token: String,
+            bot_username: String,
+            #[serde(default)]
+            respond_to_all_messages: bool,
+        }
+
+        let yaml = r#"
+telegram_bot_token: tok
+bot_username: legacy_bot
+api_key: key
+channels:
+  slack:
+    bot_token: xoxb-test
+    app_token: xapp-test
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+
+        let tg: TelegramConfigView =
+            serde_yaml::from_value(config.channels.get("telegram").unwrap().clone()).unwrap();
+        assert_eq!(tg.bot_token, "tok");
+        assert_eq!(tg.bot_username, "legacy_bot");
+        assert!(!tg.respond_to_all_messages);
+    }
+
+    #[test]
+    fn test_post_deserialize_prefers_explicit_telegram_channel_over_legacy_fields() {
+        #[derive(Deserialize)]
+        struct TelegramConfigView {
+            bot_token: String,
+            bot_username: String,
+            #[serde(default)]
+            respond_to_all_messages: bool,
+        }
+
+        let yaml = r#"
+telegram_bot_token: legacy_tok
+bot_username: legacy_bot
+api_key: key
+channels:
+  telegram:
+    bot_token: channel_tok
+    bot_username: channel_bot
+    respond_to_all_messages: true
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+
+        let tg: TelegramConfigView =
+            serde_yaml::from_value(config.channels.get("telegram").unwrap().clone()).unwrap();
+        assert_eq!(tg.bot_token, "channel_tok");
+        assert_eq!(tg.bot_username, "channel_bot");
+        assert!(tg.respond_to_all_messages);
     }
 
     #[test]

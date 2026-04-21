@@ -410,6 +410,36 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), RayClawError> {
 }
 
 impl Database {
+    fn telegram_general_external_chat_id_for(
+        conn: &Connection,
+        chat_id: i64,
+    ) -> Result<Option<String>, RayClawError> {
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT channel, external_chat_id FROM chats WHERE chat_id = ?1",
+                params![chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((channel, external_chat_id)) = row else {
+            return Ok(None);
+        };
+        if channel.as_deref() != Some("telegram") {
+            return Ok(None);
+        }
+        let Some(external_chat_id) = external_chat_id else {
+            return Ok(None);
+        };
+        let Some((root_chat_id, _thread_id)) = external_chat_id.rsplit_once(':') else {
+            return Ok(None);
+        };
+        if root_chat_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(root_chat_id.to_string()))
+    }
+
     fn lock_conn(&self) -> MutexGuard<'_, Connection> {
         match self.conn.lock() {
             Ok(guard) => guard,
@@ -599,8 +629,8 @@ impl Database {
                 chat_title = COALESCE(?2, chat_title),
                 chat_type = ?3,
                 last_message_time = ?4,
-                channel = COALESCE(?5, channel),
-                external_chat_id = COALESCE(?6, external_chat_id)",
+                channel = COALESCE(channel, ?5),
+                external_chat_id = COALESCE(external_chat_id, ?6)",
             params![
                 chat_id,
                 chat_title,
@@ -1802,7 +1832,20 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<Memory>, RayClawError> {
         let conn = self.lock_conn();
-        let mut stmt = conn.prepare(
+        let telegram_general_external_chat_id =
+            Self::telegram_general_external_chat_id_for(&conn, chat_id)?;
+        let sql = if telegram_general_external_chat_id.is_some() {
+            "SELECT id, chat_id, content, category, created_at, updated_at, embedding_model,
+                    confidence, source, last_seen_at, is_archived, archived_at
+             FROM memories
+             WHERE (chat_id = ?1
+                    OR chat_id IS NULL
+                    OR (chat_channel = 'telegram' AND external_chat_id = ?2))
+               AND is_archived = 0
+               AND confidence >= 0.45
+             ORDER BY updated_at DESC
+             LIMIT ?3"
+        } else {
             "SELECT id, chat_id, content, category, created_at, updated_at, embedding_model,
                     confidence, source, last_seen_at, is_archived, archived_at
              FROM memories
@@ -1810,26 +1853,35 @@ impl Database {
                AND is_archived = 0
                AND confidence >= 0.45
              ORDER BY updated_at DESC
-             LIMIT ?2",
-        )?;
-        let memories = stmt
-            .query_map(params![chat_id, limit as i64], |row| {
-                Ok(Memory {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    content: row.get(2)?,
-                    category: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    embedding_model: row.get(6)?,
-                    confidence: row.get(7)?,
-                    source: row.get(8)?,
-                    last_seen_at: row.get(9)?,
-                    is_archived: row.get::<_, i64>(10)? != 0,
-                    archived_at: row.get(11)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+             LIMIT ?2"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(Memory {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                content: row.get(2)?,
+                category: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                embedding_model: row.get(6)?,
+                confidence: row.get(7)?,
+                source: row.get(8)?,
+                last_seen_at: row.get(9)?,
+                is_archived: row.get::<_, i64>(10)? != 0,
+                archived_at: row.get(11)?,
+            })
+        };
+        let memories = if let Some(general_external_chat_id) = telegram_general_external_chat_id {
+            stmt.query_map(
+                params![chat_id, general_external_chat_id, limit as i64],
+                map_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![chat_id, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(memories)
     }
 
@@ -1896,39 +1948,65 @@ impl Database {
     ) -> Result<Vec<Memory>, RayClawError> {
         let conn = self.lock_conn();
         let pattern = format!("%{}%", query.to_lowercase());
-        let mut sql = String::from(
-            "SELECT id, chat_id, content, category, created_at, updated_at, embedding_model,
-                    confidence, source, last_seen_at, is_archived, archived_at
-             FROM memories
-             WHERE (chat_id = ?1 OR chat_id IS NULL)
-               AND LOWER(content) LIKE ?2",
-        );
+        let telegram_general_external_chat_id =
+            Self::telegram_general_external_chat_id_for(&conn, chat_id)?;
+        let mut sql = if telegram_general_external_chat_id.is_some() {
+            String::from(
+                "SELECT id, chat_id, content, category, created_at, updated_at, embedding_model,
+                        confidence, source, last_seen_at, is_archived, archived_at
+                 FROM memories
+                 WHERE (chat_id = ?1
+                        OR chat_id IS NULL
+                        OR (chat_channel = 'telegram' AND external_chat_id = ?2))
+                   AND LOWER(content) LIKE ?3",
+            )
+        } else {
+            String::from(
+                "SELECT id, chat_id, content, category, created_at, updated_at, embedding_model,
+                        confidence, source, last_seen_at, is_archived, archived_at
+                 FROM memories
+                 WHERE (chat_id = ?1 OR chat_id IS NULL)
+                   AND LOWER(content) LIKE ?2",
+            )
+        };
         if !include_archived {
             sql.push_str(" AND is_archived = 0");
         }
         if !broad_recall {
             sql.push_str(" AND confidence >= 0.45");
         }
-        sql.push_str(" ORDER BY confidence DESC, updated_at DESC LIMIT ?3");
+        sql.push_str(if telegram_general_external_chat_id.is_some() {
+            " ORDER BY confidence DESC, updated_at DESC LIMIT ?4"
+        } else {
+            " ORDER BY confidence DESC, updated_at DESC LIMIT ?3"
+        });
         let mut stmt = conn.prepare(&sql)?;
-        let memories = stmt
-            .query_map(params![chat_id, pattern, limit as i64], |row| {
-                Ok(Memory {
-                    id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    content: row.get(2)?,
-                    category: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    embedding_model: row.get(6)?,
-                    confidence: row.get(7)?,
-                    source: row.get(8)?,
-                    last_seen_at: row.get(9)?,
-                    is_archived: row.get::<_, i64>(10)? != 0,
-                    archived_at: row.get(11)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(Memory {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                content: row.get(2)?,
+                category: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                embedding_model: row.get(6)?,
+                confidence: row.get(7)?,
+                source: row.get(8)?,
+                last_seen_at: row.get(9)?,
+                is_archived: row.get::<_, i64>(10)? != 0,
+                archived_at: row.get(11)?,
+            })
+        };
+        let memories = if let Some(general_external_chat_id) = telegram_general_external_chat_id {
+            stmt.query_map(
+                params![chat_id, general_external_chat_id, pattern, limit as i64],
+                map_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![chat_id, pattern, limit as i64], map_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         Ok(memories)
     }
 
@@ -3359,6 +3437,46 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_chat_preserves_existing_telegram_topic_external_id() {
+        let (db, dir) = test_db();
+
+        let topic_chat_id = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("CareAI 247"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        db.upsert_chat(topic_chat_id, Some("CareAI 247"), "telegram_supergroup")
+            .unwrap();
+
+        let conn = db.lock_conn();
+        let (channel, external_chat_id): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT channel, external_chat_id FROM chats WHERE chat_id = ?1",
+                params![topic_chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(channel.as_deref(), Some("telegram"));
+        assert_eq!(external_chat_id.as_deref(), Some("-1003910870189:57"));
+        drop(conn);
+
+        let resolved_again = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("CareAI 247"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        assert_eq!(resolved_again, topic_chat_id);
+
+        cleanup(&dir);
+    }
+
+    #[test]
     fn test_migration_backfills_chat_identity_columns() {
         let dir = std::env::temp_dir().join(format!(
             "rayclaw_migration_chat_identity_{}",
@@ -3610,6 +3728,51 @@ mod tests {
     }
 
     #[test]
+    fn test_telegram_topic_context_includes_general_topic_memories() {
+        let (db, dir) = test_db();
+
+        let general_chat_id = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189",
+                Some("TD-Rayclaw"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        let topic_chat_id = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("CareAI 247"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+
+        db.insert_memory(
+            Some(general_chat_id),
+            "Fizzy token saved in General",
+            "KNOWLEDGE",
+        )
+        .unwrap();
+        db.insert_memory(
+            Some(topic_chat_id),
+            "CareAI project lives in ~/Projects/careai",
+            "KNOWLEDGE",
+        )
+        .unwrap();
+        db.insert_memory(None, "Global memory", "KNOWLEDGE")
+            .unwrap();
+
+        let mems = db.get_memories_for_context(topic_chat_id, 10).unwrap();
+        let contents: Vec<&str> = mems.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains(&"Fizzy token saved in General"));
+        assert!(contents.contains(&"CareAI project lives in ~/Projects/careai"));
+        assert!(contents.contains(&"Global memory"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
     fn test_get_all_memories_for_chat() {
         let (db, dir) = test_db();
         db.insert_memory(Some(100), "chat 100 mem", "PROFILE")
@@ -3697,6 +3860,51 @@ mod tests {
 
         let results = db.search_memories(100, "nonexistent_xyz", 10).unwrap();
         assert!(results.is_empty());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_telegram_topic_search_includes_general_topic_memories() {
+        let (db, dir) = test_db();
+
+        let general_chat_id = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189",
+                Some("TD-Rayclaw"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        let topic_chat_id = db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("CareAI 247"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+
+        db.insert_memory(
+            Some(general_chat_id),
+            "Fizzy CLI token is abc123",
+            "KNOWLEDGE",
+        )
+        .unwrap();
+        db.insert_memory(
+            Some(topic_chat_id),
+            "CareAI uses Fizzy for deployment",
+            "KNOWLEDGE",
+        )
+        .unwrap();
+        db.insert_memory(Some(999), "Unrelated Fizzy note", "KNOWLEDGE")
+            .unwrap();
+
+        let results = db.search_memories(topic_chat_id, "fizzy", 10).unwrap();
+        let contents: Vec<&str> = results.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains(&"Fizzy CLI token is abc123"));
+        assert!(contents.contains(&"CareAI uses Fizzy for deployment"));
+        assert!(!contents.contains(&"Unrelated Fizzy note"));
 
         cleanup(&dir);
     }

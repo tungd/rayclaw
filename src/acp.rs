@@ -6,6 +6,7 @@
 //! MVP scope: Claude Code support only, stdio transport.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -255,7 +256,7 @@ fn build_spawn_command(config: &AcpAgentConfig, workspace: Option<&str>) -> Comm
     cmd.envs(&config.env);
 
     if let Some(ws) = workspace.or(config.workspace.as_deref()) {
-        cmd.current_dir(ws);
+        cmd.current_dir(expand_home_path(ws));
     }
 
     cmd.stdin(std::process::Stdio::piped());
@@ -263,6 +264,19 @@ fn build_spawn_command(config: &AcpAgentConfig, workspace: Option<&str>) -> Comm
     cmd.stderr(std::process::Stdio::piped());
 
     cmd
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +670,7 @@ impl AcpConnection {
 
         let mut result = AcpPromptResult {
             messages: Vec::new(),
+            tool_outputs: Vec::new(),
             tool_calls: Vec::new(),
             files_changed: Vec::new(),
             completed: false,
@@ -956,7 +971,7 @@ impl AcpConnection {
                                         other => other.to_string(),
                                     };
                                     if !output_str.is_empty() {
-                                        result.messages.push(output_str);
+                                        result.tool_outputs.push(output_str);
                                     }
                                 }
                                 // Capture content blocks (terminal output, diffs, etc.)
@@ -975,7 +990,7 @@ impl AcpConnection {
                                                 .and_then(|t| t.as_str())
                                             {
                                                 if !text.is_empty() {
-                                                    result.messages.push(text.to_string());
+                                                    result.tool_outputs.push(text.to_string());
                                                 }
                                             }
                                         }
@@ -1206,6 +1221,7 @@ impl PtyConnection {
         Ok(AcpPromptResult {
             completed: true,
             messages,
+            tool_outputs: vec![],
             tool_calls: vec![],
             files_changed: vec![],
             duration_ms,
@@ -1312,8 +1328,10 @@ pub struct ToolCallInfo {
 /// Result of an ACP prompt execution
 #[derive(Debug, Clone)]
 pub struct AcpPromptResult {
-    /// Text messages emitted by the agent
+    /// Text messages emitted directly by the agent
     pub messages: Vec<String>,
+    /// Raw tool output observed during execution (stdout, diffs, etc.)
+    pub tool_outputs: Vec<String>,
     /// Tool calls executed by the agent
     pub tool_calls: Vec<ToolCallInfo>,
     /// Files changed during execution
@@ -1325,6 +1343,28 @@ pub struct AcpPromptResult {
     /// True if the agent process had crashed and was restarted for this
     /// prompt. Previous conversation context was lost.
     pub context_reset: bool,
+}
+
+impl AcpPromptResult {
+    /// Join only the agent-authored text, excluding raw tool output.
+    pub fn agent_text(&self) -> String {
+        self.messages
+            .iter()
+            .filter(|msg| !msg.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Best-effort user-facing text for chat forwarding.
+    pub fn forwarded_text(&self) -> String {
+        let text = self.agent_text();
+        if text.is_empty() {
+            "(Agent completed with no output)".to_string()
+        } else {
+            text
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1415,45 @@ pub type JobCompletionCallback = Arc<
         + Send
         + Sync,
 >;
+
+/// Spawn a throttled progress forwarder that turns ACP progress events into
+/// short chat updates using the provided callback.
+pub fn spawn_progress_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
+    chat_id: i64,
+    callback: JobCompletionCallback,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let throttle = Duration::from_secs(5);
+        let mut last_sent = tokio::time::Instant::now() - throttle;
+
+        while let Some(event) = rx.recv().await {
+            let now = tokio::time::Instant::now();
+            let text = match event {
+                AcpProgressEvent::ToolStart { name } => {
+                    if now.duration_since(last_sent) >= throttle {
+                        Some(format!("🔧 Running tool: {name}"))
+                    } else {
+                        None
+                    }
+                }
+                AcpProgressEvent::ToolComplete { name, status } => {
+                    if now.duration_since(last_sent) >= throttle {
+                        Some(format!("✅ {name}: {status}"))
+                    } else {
+                        None
+                    }
+                }
+                AcpProgressEvent::Thinking { .. } => None,
+            };
+
+            if let Some(text) = text {
+                last_sent = tokio::time::Instant::now();
+                callback(chat_id, text).await;
+            }
+        }
+    })
+}
 
 /// An active ACP agent session with its connection
 pub struct AcpSession {
@@ -1496,8 +1575,13 @@ impl AcpManager {
             .unwrap_or(self.config.default_auto_approve);
 
         let effective_workspace = workspace
-            .map(|s| s.to_string())
-            .or_else(|| agent_config.workspace.clone())
+            .map(|s| expand_home_path(s).to_string_lossy().to_string())
+            .or_else(|| {
+                agent_config
+                    .workspace
+                    .as_deref()
+                    .map(|s| expand_home_path(s).to_string_lossy().to_string())
+            })
             .unwrap_or_else(|| ".".to_string());
 
         let is_pty_mode = agent_config.mode == "pty";
@@ -1892,6 +1976,7 @@ impl AcpManager {
         timeout_secs: Option<u64>,
         chat_id: Option<i64>,
         on_complete: Option<JobCompletionCallback>,
+        on_progress: Option<JobCompletionCallback>,
     ) -> Result<String, String> {
         // Validate session exists
         {
@@ -1949,38 +2034,31 @@ impl AcpManager {
         let msg = message.to_string();
         let jid = job_id.clone();
         let agent_id_for_task = agent_id.clone();
+        let progress_callback = on_progress.clone();
 
         tokio::spawn(async move {
-            let agent_id = agent_id_for_task;
-            let result = manager.prompt(&sid, &msg, timeout_secs, None).await;
+            let _agent_id = agent_id_for_task;
+            let (progress_tx, progress_handle) = match (chat_id, progress_callback) {
+                (Some(cid), Some(cb)) => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
+                    let handle = spawn_progress_forwarder(rx, cid, cb);
+                    (Some(tx), Some(handle))
+                }
+                _ => (None, None),
+            };
+
+            let result = manager
+                .prompt(&sid, &msg, timeout_secs, progress_tx.as_ref())
+                .await;
+            drop(progress_tx);
+            if let Some(handle) = progress_handle {
+                let _ = handle.await;
+            }
             let now = chrono::Utc::now();
 
             // Format notification text before updating job store
             let notification = match &result {
-                Ok(r) => {
-                    let mut text = String::new();
-                    if r.context_reset {
-                        text.push_str("[Agent restarted — previous context lost]\n\n");
-                    }
-                    for m in &r.messages {
-                        if !m.is_empty() {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(m);
-                        }
-                    }
-                    if !r.tool_calls.is_empty() {
-                        if !text.is_empty() {
-                            text.push_str("\n\n");
-                        }
-                        text.push_str(&format!("[{} tool call(s)]", r.tool_calls.len()));
-                    }
-                    if text.is_empty() {
-                        text = "(Agent completed with no output)".to_string();
-                    }
-                    text
-                }
+                Ok(r) => r.forwarded_text(),
                 Err(e) => format!("ACP job failed: {e}"),
             };
 
@@ -2005,8 +2083,7 @@ impl AcpManager {
 
             // Fire completion callback
             if let (Some(cid), Some(cb)) = (chat_id, on_complete) {
-                let header = format!("[ACP job {jid} ({agent_id})]:\n");
-                cb(cid, format!("{header}{notification}")).await;
+                cb(cid, notification).await;
             }
 
             info!("ACP job {jid} finished");
@@ -2343,6 +2420,22 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_home_path_expands_tilde() {
+        let home = std::env::var_os("HOME").expect("HOME should be set for ACP tests");
+        let home = std::path::PathBuf::from(home);
+
+        assert_eq!(expand_home_path("~"), home);
+        assert_eq!(
+            expand_home_path("~/Projects/careai"),
+            home.join("Projects/careai")
+        );
+        assert_eq!(
+            expand_home_path("/Users/td/Projects/careai"),
+            std::path::PathBuf::from("/Users/td/Projects/careai")
+        );
+    }
+
+    #[test]
     fn test_jsonrpc_message_classification() {
         // Response
         let resp: JsonRpcMessage =
@@ -2371,6 +2464,7 @@ mod tests {
     fn test_prompt_result_default() {
         let result = AcpPromptResult {
             messages: vec!["hello".to_string()],
+            tool_outputs: vec!["ls output".to_string()],
             tool_calls: vec![ToolCallInfo {
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
@@ -2382,10 +2476,48 @@ mod tests {
         };
 
         assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.tool_outputs.len(), 1);
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "bash");
         assert!(result.completed);
         assert_eq!(result.duration_ms, 1234);
+        assert_eq!(result.agent_text(), "hello");
+        assert_eq!(result.forwarded_text(), "hello");
+    }
+
+    #[test]
+    fn test_prompt_result_forwarded_text_ignores_tool_output() {
+        let result = AcpPromptResult {
+            messages: vec!["Agent reply".to_string()],
+            tool_outputs: vec![
+                "cargo test output".to_string(),
+                "git diff --stat".to_string(),
+            ],
+            tool_calls: vec![],
+            files_changed: vec![],
+            completed: true,
+            duration_ms: 42,
+            context_reset: false,
+        };
+
+        assert_eq!(result.agent_text(), "Agent reply");
+        assert_eq!(result.forwarded_text(), "Agent reply");
+    }
+
+    #[test]
+    fn test_prompt_result_forwarded_text_fallback_when_empty() {
+        let result = AcpPromptResult {
+            messages: vec!["   ".to_string()],
+            tool_outputs: vec!["raw stdout".to_string()],
+            tool_calls: vec![],
+            files_changed: vec![],
+            completed: true,
+            duration_ms: 1,
+            context_reset: false,
+        };
+
+        assert_eq!(result.agent_text(), "");
+        assert_eq!(result.forwarded_text(), "(Agent completed with no output)");
     }
 
     #[tokio::test]
@@ -2794,6 +2926,7 @@ mod tests {
     fn test_prompt_result_context_reset_default_false() {
         let result = AcpPromptResult {
             messages: vec![],
+            tool_outputs: vec![],
             tool_calls: vec![],
             files_changed: vec![],
             completed: true,
@@ -2807,6 +2940,7 @@ mod tests {
     fn test_prompt_result_context_reset_true() {
         let result = AcpPromptResult {
             messages: vec!["recovered".to_string()],
+            tool_outputs: vec![],
             tool_calls: vec![],
             files_changed: vec![],
             completed: true,
@@ -2899,7 +3033,7 @@ mod tests {
     async fn test_submit_job_session_not_found() {
         let manager = Arc::new(AcpManager::from_config(AcpConfig::default()));
         let result = manager
-            .submit_job("nonexistent", "hello", None, None, None)
+            .submit_job("nonexistent", "hello", None, None, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));

@@ -1374,6 +1374,7 @@ mod tests {
             working_dir_isolation: crate::config::WorkingDirIsolation::Chat,
             timezone: "UTC".into(),
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             embedding_provider: None,
             embedding_api_key: None,
             embedding_base_url: None,

@@ -520,37 +520,7 @@ async fn maybe_handle_acp(
             let _ = progress_handle.await;
 
             match prompt_result {
-                Ok(result) => {
-                    let mut output = String::new();
-
-                    if result.context_reset {
-                        output.push_str("[Agent process crashed and was restarted. Previous conversation context was lost.]\n\n");
-                    }
-
-                    // Include agent messages
-                    for msg in &result.messages {
-                        if !msg.is_empty() {
-                            if !output.is_empty() {
-                                output.push('\n');
-                            }
-                            output.push_str(msg);
-                        }
-                    }
-
-                    // Include tool call summary if any
-                    if !result.tool_calls.is_empty() {
-                        if !output.is_empty() {
-                            output.push_str("\n\n");
-                        }
-                        output.push_str(&format!("[{} tool call(s)]", result.tool_calls.len()));
-                    }
-
-                    if output.is_empty() {
-                        output = "(Agent completed with no output)".to_string();
-                    }
-
-                    Ok(Some(output))
-                }
+                Ok(result) => Ok(Some(result.forwarded_text())),
                 Err(e) => Ok(Some(format!("ACP error: {e}"))),
             }
         } else {
@@ -859,7 +829,8 @@ pub(crate) async fn process_with_agent_impl(
     };
 
     // Agentic tool-use loop
-    let mut failed_tools: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut unresolved_failed_tools: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     let mut empty_visible_reply_retry_attempted = false;
     let mut loop_detector = LoopDetector::new(state.config.max_loop_repeats);
     let mut overflow_recovery_attempted = false;
@@ -1029,10 +1000,14 @@ pub(crate) async fn process_with_agent_impl(
             } else {
                 display_text
             };
-            let final_text = if failed_tools.is_empty() {
+            let final_text = if unresolved_failed_tools.is_empty() {
                 final_text
             } else {
-                let tools = failed_tools.iter().cloned().collect::<Vec<_>>().join(", ");
+                let tools = unresolved_failed_tools
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
                     "{final_text}\n\nExecution note: some tool actions failed in this request ({tools}). Ask me to retry if needed."
                 )
@@ -1088,7 +1063,7 @@ pub(crate) async fn process_with_agent_impl(
                         .execute_with_auth(name, input.clone(), &tool_auth)
                         .await;
                     if result.is_error {
-                        failed_tools.insert(name.clone());
+                        unresolved_failed_tools.insert(name.clone());
                         let preview = if result.content.chars().count() > 300 {
                             let clipped = result.content.chars().take(300).collect::<String>();
                             format!("{clipped}...")
@@ -1101,6 +1076,8 @@ pub(crate) async fn process_with_agent_impl(
                             iteration + 1,
                             preview
                         );
+                    } else {
+                        unresolved_failed_tools.remove(name);
                     }
                     if let Some(tx) = event_tx {
                         let preview = if result.content.chars().count() > 160 {
@@ -1553,8 +1530,9 @@ ACP coding agents: users interact with external agents via `#new`, `#end`, `#age
 - If `todo_read` returns tasks from a previous request that are no longer relevant, clear them with `todo_write` and create a fresh plan for the current request. Never blindly resume stale in_progress tasks.
 
 ## Memory
-- Use `chat` scope for information specific to this conversation.
-- Use `global` scope for knowledge useful across all conversations.
+- Default to `chat` scope for remembered information.
+- Use `global` scope only for preferences or facts that should apply across all conversations.
+- If a global memory write is rejected by permissions, immediately retry with `chat` scope and continue without surfacing the failed attempt if the retry succeeds.
 
 ## Scheduling
 - Cron expressions use 6 fields: `sec min hour dom month dow` (e.g., `0 */5 * * * *`).
@@ -2037,6 +2015,59 @@ mod tests {
         }
     }
 
+    struct WriteMemoryRecoveryLlm {
+        calls: Arc<AtomicUsize>,
+        chat_id: i64,
+        retry_after_failure: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for WriteMemoryRecoveryLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = match idx {
+                0 => MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: "mem_global".to_string(),
+                        name: "write_memory".to_string(),
+                        input: serde_json::json!({
+                            "scope": "global",
+                            "content": "Use Codex for personal and school; Claude Code for work."
+                        }),
+                    }],
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: None,
+                },
+                1 if self.retry_after_failure => MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: "mem_chat".to_string(),
+                        name: "write_memory".to_string(),
+                        input: serde_json::json!({
+                            "scope": "chat",
+                            "chat_id": self.chat_id,
+                            "content": "Use Codex for personal and school; Claude Code for work."
+                        }),
+                    }],
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: None,
+                },
+                _ => MessagesResponse {
+                    content: vec![ResponseContentBlock::Text {
+                        text: "Saved preference.".to_string(),
+                    }],
+                    stop_reason: Some("end_turn".to_string()),
+                    usage: None,
+                },
+            };
+            Ok(response)
+        }
+    }
+
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("mc_agent_engine_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2072,6 +2103,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2372,6 +2404,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
+    #[tokio::test]
+    async fn test_recovered_tool_failure_does_not_append_execution_note() {
+        let base_dir =
+            std::env::temp_dir().join(format!("mc_agent_recovered_tool_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let chat_id = 77;
+        let state = test_state_with_llm(
+            &base_dir,
+            Box::new(WriteMemoryRecoveryLlm {
+                calls: calls.clone(),
+                chat_id,
+                retry_after_failure: true,
+            }),
+        );
+        store_user_message(&state.db, chat_id, "Please save this preference for later.");
+
+        let reply = process_with_agent(
+            &state,
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "web",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "Saved preference.");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let chat_memory = base_dir
+            .join("groups")
+            .join(chat_id.to_string())
+            .join("AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(chat_memory).unwrap(),
+            "Use Codex for personal and school; Claude Code for work."
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_unrecovered_tool_failure_appends_execution_note() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_unrecovered_tool_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let chat_id = 78;
+        let state = test_state_with_llm(
+            &base_dir,
+            Box::new(WriteMemoryRecoveryLlm {
+                calls: calls.clone(),
+                chat_id,
+                retry_after_failure: false,
+            }),
+        );
+        store_user_message(&state.db, chat_id, "Please save this preference for later.");
+
+        let reply = process_with_agent(
+            &state,
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "web",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(reply.contains("Saved preference."));
+        assert!(reply.contains("Execution note: some tool actions failed"));
+        assert!(reply.contains("write_memory"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
     #[test]
     fn test_build_system_prompt_with_soul() {
         let soul = "I am a friendly pirate assistant. I speak in pirate lingo and love adventure.";
@@ -2425,6 +2544,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2490,6 +2610,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,

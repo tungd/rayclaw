@@ -9,6 +9,8 @@ website/
 tmp/
 working_dir/
 web/node_modules/
+web/pnpm-lock.yaml
+.pnpm-store/
 dist/
 imgs/
 RAYCLAW_APP.md

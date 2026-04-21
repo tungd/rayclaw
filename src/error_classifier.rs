@@ -176,7 +176,7 @@ pub fn classify_http(status: u16, body: &str) -> ClassifiedError {
     // --- everything else is permanent ---
     ClassifiedError {
         category: LlmErrorCategory::Permanent,
-        message: extract_message(body).unwrap_or_else(|| format!("API error (HTTP {status})")),
+        message: extract_message(body).unwrap_or_else(|| fallback_http_message(status, body)),
         status: Some(status),
         error_type: None,
         retry_after: None,
@@ -253,6 +253,20 @@ fn extract_message(body: &str) -> Option<String> {
         return Some(msg.to_string());
     }
     None
+}
+
+fn fallback_http_message(status: u16, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return format!("API error (HTTP {status})");
+    }
+
+    let compact = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = compact.chars().take(400).collect::<String>();
+    if compact.chars().count() > 400 {
+        snippet.push_str("...");
+    }
+    format!("API error (HTTP {status}): {snippet}")
 }
 
 #[cfg(test)]
@@ -438,6 +452,13 @@ mod tests {
     fn test_extract_message_non_json() {
         let msg = extract_message("plain text error");
         assert!(msg.is_none());
+    }
+
+    #[test]
+    fn test_classify_http_preserves_plain_text_body() {
+        let c = classify_http(405, "method not allowed");
+        assert_eq!(c.category, LlmErrorCategory::Permanent);
+        assert_eq!(c.message, "API error (HTTP 405): method not allowed");
     }
 
     #[test]

@@ -75,11 +75,11 @@ cargo add rayclaw
 | `discord` | 是 | serenity | Discord 渠道适配器 |
 | `slack` | 是 | -- | Slack 渠道适配器（Socket Mode） |
 | `feishu` | 是 | -- | 飞书/Lark 渠道适配器 |
-| `web` | **否** | axum | 内置 Web UI 和 HTTP API |
+| `web` | 是 | axum | 内置 Web UI 和 HTTP API |
 | `all` | 否 | 以上全部 | 便捷选项：启用所有 feature（含 `web`） |
 | `sqlite-vec` | 否 | sqlite-vec | 语义记忆向量检索 |
 
-> **重要：** `web` feature 没有包含在默认 features 中，因为它在编译时通过 `include_dir!` 嵌入预构建的前端资源（`web/dist/`）。Crate 使用者没有这些资源文件。如需 Web UI，请从源码使用 `--features all` 构建。
+> **重要：** 默认构建包含 `web` feature，并会在编译时通过 `include_dir!` 嵌入 `web/dist/` 中的前端静态资源。如果缺少 `web/dist/`，请先执行 `pnpm --dir web install && pnpm --dir web build`。
 
 **最小 SDK 用法（不含渠道和 Web）：**
 
@@ -113,7 +113,7 @@ rayclaw = { version = "0.1", features = ["telegram", "discord"] }
 **本地编译二进制（全部 features + Web UI）：**
 
 ```sh
-cargo build --release --features all
+cargo build --release
 ```
 
 ## 工作原理
@@ -159,16 +159,16 @@ curl -fsSL https://rayclaw.ai/uninstall.sh | bash
 ```sh
 git clone https://github.com/rayclaw/rayclaw.git
 cd rayclaw
-cargo build --release --features all
+cargo build --release
 cp target/release/rayclaw /usr/local/bin/
 ```
 
-> **注意：** `web` feature（内置 Web UI）不包含在默认 features 中。本地编译二进制时请使用 `--features all` 以启用所有渠道和 Web UI，否则 Web UI 将不可用。
+> **注意：** 默认二进制构建已包含 `web` feature（内置 Web UI）。如果缺少 `web/dist/`，请先执行 `pnpm --dir web install && pnpm --dir web build`。
 
 可选语义记忆构建（默认关闭 sqlite-vec）：
 
 ```sh
-cargo build --release --features all,sqlite-vec
+cargo build --release --features sqlite-vec
 ```
 
 首次启用 sqlite-vec（最短 3 条命令）：

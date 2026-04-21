@@ -2,7 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::acp::{AcpManager, JobCompletionCallback};
+use crate::acp::{AcpManager, AcpPromptResult, JobCompletionCallback};
+use crate::db::{call_blocking, Database, Memory};
 use crate::llm_types::ToolDefinition;
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,28 +14,67 @@ use super::{auth_context_from_input, schema_object, Tool, ToolResult};
 pub type NotifyFn =
     Arc<dyn Fn(i64, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+fn progress_callback_from_notify(notify: Option<&NotifyFn>) -> Option<JobCompletionCallback> {
+    notify.cloned().map(|notify| {
+        Arc::new(move |chat_id: i64, text: String| notify(chat_id, text)) as JobCompletionCallback
+    })
+}
+
+async fn prompt_with_progress_updates(
+    manager: &Arc<AcpManager>,
+    session_id: &str,
+    message: &str,
+    timeout_secs: Option<u64>,
+    chat_id: Option<i64>,
+    progress_callback: Option<JobCompletionCallback>,
+) -> Result<AcpPromptResult, String> {
+    let (progress_tx, progress_handle) = match (chat_id, progress_callback) {
+        (Some(cid), Some(cb)) => {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::acp::AcpProgressEvent>();
+            let handle = crate::acp::spawn_progress_forwarder(rx, cid, cb);
+            (Some(tx), Some(handle))
+        }
+        _ => (None, None),
+    };
+
+    let result = manager
+        .prompt(session_id, message, timeout_secs, progress_tx.as_ref())
+        .await;
+    drop(progress_tx);
+    if let Some(handle) = progress_handle {
+        let _ = handle.await;
+    }
+    result
+}
+
 /// Build all ACP tools sharing a single AcpManager.
 pub fn make_acp_tools(manager: Arc<AcpManager>) -> Vec<Box<dyn Tool>> {
-    make_acp_tools_with_callback(manager, None, None)
+    make_acp_tools_with_callback(manager, None, None, None)
 }
 
 /// Build all ACP tools with optional job completion and notification callbacks.
 pub fn make_acp_tools_with_callback(
     manager: Arc<AcpManager>,
+    db: Option<Arc<Database>>,
     on_job_complete: Option<JobCompletionCallback>,
     notify: Option<NotifyFn>,
 ) -> Vec<Box<dyn Tool>> {
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(AcpCodingTool::new(
             manager.clone(),
+            db.clone(),
             on_job_complete.clone(),
             notify.clone(),
         )),
-        Box::new(AcpNewSessionTool::new(manager.clone(), notify)),
-        Box::new(AcpPromptTool::new(manager.clone())),
+        Box::new(AcpNewSessionTool::new(manager.clone(), notify.clone())),
+        Box::new(AcpPromptTool::new(manager.clone(), notify.clone())),
         Box::new(AcpEndSessionTool::new(manager.clone())),
         Box::new(AcpListSessionsTool::new(manager.clone())),
-        Box::new(AcpSubmitJobTool::new(manager.clone(), on_job_complete)),
+        Box::new(AcpSubmitJobTool::new(
+            manager.clone(),
+            on_job_complete,
+            notify,
+        )),
         Box::new(AcpJobStatusTool::new(manager)),
     ];
     tools
@@ -46,6 +86,7 @@ pub fn make_acp_tools_with_callback(
 
 struct AcpCodingTool {
     manager: Arc<AcpManager>,
+    db: Option<Arc<Database>>,
     on_complete: Option<JobCompletionCallback>,
     notify: Option<NotifyFn>,
 }
@@ -53,11 +94,13 @@ struct AcpCodingTool {
 impl AcpCodingTool {
     fn new(
         manager: Arc<AcpManager>,
+        db: Option<Arc<Database>>,
         on_complete: Option<JobCompletionCallback>,
         notify: Option<NotifyFn>,
     ) -> Self {
         Self {
             manager,
+            db,
             on_complete,
             notify,
         }
@@ -68,6 +111,88 @@ impl AcpCodingTool {
             notify(chat_id, text.to_string()).await;
         }
     }
+
+    async fn resolve_agent(&self, input: &serde_json::Value, message: &str) -> String {
+        if let Some(agent) = input.get("agent").and_then(|v| v.as_str()) {
+            let agent = agent.trim();
+            if !agent.is_empty() {
+                return agent.to_lowercase();
+            }
+        }
+
+        let Some(chat_id) = auth_context_from_input(input).map(|ctx| ctx.caller_chat_id) else {
+            return "claude".to_string();
+        };
+        let Some(db) = &self.db else {
+            return "claude".to_string();
+        };
+
+        let workspace = input
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let message = message.to_lowercase();
+        let context = format!("{workspace}\n{message}");
+        let db = db.clone();
+
+        let memories =
+            match call_blocking(db, move |db| db.get_memories_for_context(chat_id, 100)).await {
+                Ok(mems) => mems,
+                Err(_) => return "claude".to_string(),
+            };
+
+        infer_agent_from_memories(chat_id, &context, &memories)
+            .unwrap_or_else(|| "claude".to_string())
+    }
+}
+
+fn infer_agent_from_memories(chat_id: i64, context: &str, memories: &[Memory]) -> Option<String> {
+    let chat_specific: Vec<String> = memories
+        .iter()
+        .filter(|m| m.chat_id == Some(chat_id))
+        .map(|m| m.content.to_lowercase())
+        .collect();
+
+    let chat_prefers_codex = chat_specific.iter().any(|m| m.contains("codex"));
+    let chat_prefers_claude = chat_specific.iter().any(|m| m.contains("claude"));
+    if chat_prefers_codex && !chat_prefers_claude {
+        return Some("codex".to_string());
+    }
+    if chat_prefers_claude && !chat_prefers_codex {
+        return Some("claude".to_string());
+    }
+
+    let all_memories = memories
+        .iter()
+        .map(|m| m.content.to_lowercase())
+        .collect::<Vec<_>>();
+
+    let matches_context = |keywords: &[&str]| keywords.iter().any(|kw| context.contains(kw));
+    let memory_has = |agent: &str, keywords: &[&str]| {
+        all_memories
+            .iter()
+            .any(|m| m.contains(agent) && keywords.iter().any(|kw| m.contains(kw)))
+    };
+
+    if matches_context(&[
+        "careai",
+        "school",
+        "/personal/",
+        "personal project",
+        "school project",
+    ]) && memory_has("codex", &["careai", "school", "personal"])
+    {
+        return Some("codex".to_string());
+    }
+
+    if matches_context(&["/work/", "work project", "professional", " bw ", " rg "])
+        && memory_has("claude", &["work", "professional"])
+    {
+        return Some("claude".to_string());
+    }
+
+    None
 }
 
 #[async_trait]
@@ -79,8 +204,9 @@ impl Tool for AcpCodingTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "acp_coding".into(),
-            description: "Delegate a coding task to an external AI coding agent (e.g. Claude Code). \
+            description: "Delegate a coding task to an external AI coding agent (for example Codex or Claude Code). \
                 Automatically manages sessions: reuses existing session for the chat or creates a new one. \
+                If agent is omitted, it resolves the best agent from chat memory/context. \
                 Sends immediate notification to the user, then executes the task. \
                 For quick tasks the result is returned directly. \
                 Set async=true for long-running tasks to get a job_id and receive results via push notification."
@@ -93,7 +219,7 @@ impl Tool for AcpCodingTool {
                     },
                     "agent": {
                         "type": "string",
-                        "description": "Agent name (default: \"claude\")"
+                        "description": "Optional agent override. If omitted, RayClaw chooses from chat memory/context and falls back to Claude."
                     },
                     "workspace": {
                         "type": "string",
@@ -119,10 +245,6 @@ impl Tool for AcpCodingTool {
             None => return ToolResult::error("Missing required parameter: message".into()),
         };
 
-        let agent = input
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .unwrap_or("claude");
         let workspace = input.get("workspace").and_then(|v| v.as_str());
         let is_async = input
             .get("async")
@@ -131,16 +253,23 @@ impl Tool for AcpCodingTool {
         let timeout_secs = input.get("timeout_secs").and_then(|v| v.as_u64());
 
         let chat_id = auth_context_from_input(&input).map(|ctx| ctx.caller_chat_id);
+        let agent = self.resolve_agent(&input, message).await;
 
         // Step 1: Try to reuse existing session for this chat
         let session_id = if let Some(cid) = chat_id {
             if let Some(existing) = self.manager.chat_session(cid).await {
-                // Verify session is still alive
+                // Reuse only if the bound session is still alive and matches the
+                // resolved agent for this task.
                 let sessions = self.manager.list_sessions().await;
-                if sessions.iter().any(|s| s.session_id == existing) {
-                    Some(existing)
+                if let Some(summary) = sessions.iter().find(|s| s.session_id == existing) {
+                    if summary.agent_id == agent {
+                        Some(existing)
+                    } else {
+                        self.manager.unbind_chat(cid).await;
+                        None
+                    }
                 } else {
-                    // Stale binding, clear it
+                    // Stale binding, clear it.
                     self.manager.unbind_chat(cid).await;
                     None
                 }
@@ -172,7 +301,7 @@ impl Tool for AcpCodingTool {
                     .await;
                 }
 
-                match self.manager.new_session(agent, workspace, None).await {
+                match self.manager.new_session(&agent, workspace, None).await {
                     Ok(info) => {
                         if let Some(cid) = chat_id {
                             self.manager.bind_chat(cid, &info.session_id).await;
@@ -207,6 +336,7 @@ impl Tool for AcpCodingTool {
                     timeout_secs,
                     chat_id,
                     self.on_complete.clone(),
+                    progress_callback_from_notify(self.notify.as_ref()),
                 )
                 .await
             {
@@ -226,42 +356,17 @@ impl Tool for AcpCodingTool {
             }
         } else {
             // Sync mode — wait for result
-            match self
-                .manager
-                .prompt(&session_id, message, timeout_secs, None)
-                .await
+            match prompt_with_progress_updates(
+                &self.manager,
+                &session_id,
+                message,
+                timeout_secs,
+                chat_id,
+                progress_callback_from_notify(self.notify.as_ref()),
+            )
+            .await
             {
-                Ok(result) => {
-                    let tool_call_summaries: Vec<serde_json::Value> = result
-                        .tool_calls
-                        .iter()
-                        .map(|tc| {
-                            json!({
-                                "tool": tc.name,
-                                "input": tc.input,
-                            })
-                        })
-                        .collect();
-
-                    let mut output = json!({
-                        "mode": "sync",
-                        "session_id": session_id,
-                        "agent": agent,
-                        "completed": result.completed,
-                        "messages": result.messages,
-                        "tool_calls": tool_call_summaries,
-                        "files_changed": result.files_changed,
-                        "duration_ms": result.duration_ms,
-                    });
-                    if result.context_reset {
-                        output["context_reset"] = json!(true);
-                        output["context_reset_notice"] = json!(
-                            "Agent process crashed and was restarted. Previous context was lost."
-                        );
-                    }
-
-                    ToolResult::success(output.to_string())
-                }
+                Ok(result) => ToolResult::success(result.forwarded_text()),
                 Err(e) => ToolResult::error(format!("Coding agent error: {e}"))
                     .with_error_type("acp_error"),
             }
@@ -378,11 +483,12 @@ impl Tool for AcpNewSessionTool {
 
 struct AcpPromptTool {
     manager: Arc<AcpManager>,
+    notify: Option<NotifyFn>,
 }
 
 impl AcpPromptTool {
-    fn new(manager: Arc<AcpManager>) -> Self {
-        Self { manager }
+    fn new(manager: Arc<AcpManager>, notify: Option<NotifyFn>) -> Self {
+        Self { manager, notify }
     }
 }
 
@@ -431,39 +537,19 @@ impl Tool for AcpPromptTool {
         };
 
         let timeout_secs = input.get("timeout_secs").and_then(|v| v.as_u64());
+        let chat_id = auth_context_from_input(&input).map(|ctx| ctx.caller_chat_id);
 
-        match self
-            .manager
-            .prompt(session_id, message, timeout_secs, None)
-            .await
+        match prompt_with_progress_updates(
+            &self.manager,
+            session_id,
+            message,
+            timeout_secs,
+            chat_id,
+            progress_callback_from_notify(self.notify.as_ref()),
+        )
+        .await
         {
-            Ok(result) => {
-                let tool_call_summaries: Vec<serde_json::Value> = result
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        json!({
-                            "tool": tc.name,
-                            "input": tc.input,
-                        })
-                    })
-                    .collect();
-
-                let mut output = json!({
-                    "completed": result.completed,
-                    "messages": result.messages,
-                    "tool_calls": tool_call_summaries,
-                    "files_changed": result.files_changed,
-                    "duration_ms": result.duration_ms,
-                });
-                if result.context_reset {
-                    output["context_reset"] = json!(true);
-                    output["context_reset_notice"] =
-                        json!("Agent process crashed and was restarted. Previous conversation context was lost.");
-                }
-
-                ToolResult::success(output.to_string())
-            }
+            Ok(result) => ToolResult::success(result.forwarded_text()),
             Err(e) => {
                 ToolResult::error(format!("ACP prompt failed: {e}")).with_error_type("acp_error")
             }
@@ -595,13 +681,19 @@ impl Tool for AcpListSessionsTool {
 struct AcpSubmitJobTool {
     manager: Arc<AcpManager>,
     on_complete: Option<JobCompletionCallback>,
+    notify: Option<NotifyFn>,
 }
 
 impl AcpSubmitJobTool {
-    fn new(manager: Arc<AcpManager>, on_complete: Option<JobCompletionCallback>) -> Self {
+    fn new(
+        manager: Arc<AcpManager>,
+        on_complete: Option<JobCompletionCallback>,
+        notify: Option<NotifyFn>,
+    ) -> Self {
         Self {
             manager,
             on_complete,
+            notify,
         }
     }
 }
@@ -658,7 +750,14 @@ impl Tool for AcpSubmitJobTool {
 
         match self
             .manager
-            .submit_job(session_id, message, timeout_secs, chat_id, self.on_complete.clone())
+            .submit_job(
+                session_id,
+                message,
+                timeout_secs,
+                chat_id,
+                self.on_complete.clone(),
+                progress_callback_from_notify(self.notify.as_ref()),
+            )
             .await
         {
             Ok(job_id) => ToolResult::success(
@@ -753,9 +852,27 @@ impl Tool for AcpJobStatusTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Memory;
 
     fn test_manager() -> Arc<AcpManager> {
         Arc::new(AcpManager::from_config_file("/nonexistent/acp.json"))
+    }
+
+    fn memory(chat_id: Option<i64>, content: &str) -> Memory {
+        Memory {
+            id: 1,
+            chat_id,
+            content: content.to_string(),
+            category: "PROFILE".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            embedding_model: None,
+            confidence: 0.8,
+            source: "test".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            is_archived: false,
+            archived_at: None,
+        }
     }
 
     #[test]
@@ -769,6 +886,29 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 7, "Tool names must be unique");
+    }
+
+    #[test]
+    fn test_infer_agent_from_chat_specific_memory_prefers_codex() {
+        let memories = vec![
+            memory(
+                Some(123),
+                "Use OpenAI Codex for CareAI school project coding tasks",
+            ),
+            memory(None, "General note"),
+        ];
+        let agent = infer_agent_from_memories(123, "/users/td/projects/careai", &memories);
+        assert_eq!(agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_infer_agent_from_context_prefers_claude_for_work() {
+        let memories = vec![memory(
+            None,
+            "Use Claude Code for work/professional coding projects",
+        )];
+        let agent = infer_agent_from_memories(123, "/users/td/projects/work/bw", &memories);
+        assert_eq!(agent.as_deref(), Some("claude"));
     }
 
     #[test]
@@ -827,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_missing_params() {
         let manager = test_manager();
-        let tool = AcpPromptTool::new(manager);
+        let tool = AcpPromptTool::new(manager, None);
 
         // Missing session_id
         let r1 = tool.execute(json!({"message": "hello"})).await;
@@ -843,7 +983,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_session_not_found() {
         let manager = test_manager();
-        let tool = AcpPromptTool::new(manager);
+        let tool = AcpPromptTool::new(manager, None);
         let result = tool
             .execute(json!({"session_id": "nonexistent", "message": "hello"}))
             .await;
@@ -986,7 +1126,7 @@ mod tests {
     #[test]
     fn test_acp_prompt_schema_details() {
         let manager = test_manager();
-        let tool = AcpPromptTool::new(manager);
+        let tool = AcpPromptTool::new(manager, None);
         let def = tool.definition();
 
         let props = def.input_schema["properties"].as_object().unwrap();
@@ -1045,7 +1185,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_job_missing_params() {
         let manager = test_manager();
-        let tool = AcpSubmitJobTool::new(manager, None);
+        let tool = AcpSubmitJobTool::new(manager, None, None);
 
         let r1 = tool.execute(json!({"message": "hello"})).await;
         assert!(r1.is_error);
@@ -1059,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_job_session_not_found() {
         let manager = test_manager();
-        let tool = AcpSubmitJobTool::new(manager, None);
+        let tool = AcpSubmitJobTool::new(manager, None, None);
         let result = tool
             .execute(json!({"session_id": "nonexistent", "message": "hello"}))
             .await;
@@ -1088,7 +1228,7 @@ mod tests {
     #[test]
     fn test_submit_job_schema_details() {
         let manager = test_manager();
-        let tool = AcpSubmitJobTool::new(manager, None);
+        let tool = AcpSubmitJobTool::new(manager, None, None);
         let def = tool.definition();
 
         let props = def.input_schema["properties"].as_object().unwrap();

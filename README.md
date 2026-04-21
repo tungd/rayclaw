@@ -83,16 +83,16 @@ curl -fsSL https://rayclaw.ai/uninstall.sh | bash
 ```sh
 git clone https://github.com/rayclaw/rayclaw.git
 cd rayclaw
-cargo build --release --features all
+cargo build --release
 cp target/release/rayclaw /usr/local/bin/
 ```
 
-> **Note:** The `web` feature (built-in Web UI) is not included in default features. When building the binary locally, use `--features all` to enable all channels and Web UI. Without it, the Web UI will not be available.
+> **Note:** The default binary build includes the `web` feature (built-in Web UI). If `web/dist/` is missing, build the frontend first with `pnpm --dir web install && pnpm --dir web build`.
 
 Optional semantic-memory build (sqlite-vec disabled by default):
 
 ```sh
-cargo build --release --features all,sqlite-vec
+cargo build --release --features sqlite-vec
 ```
 
 First-time sqlite-vec quickstart (3 commands):
@@ -133,11 +133,11 @@ cargo add rayclaw
 | `discord` | Yes | serenity | Discord channel adapter |
 | `slack` | Yes | -- | Slack channel adapter (Socket Mode) |
 | `feishu` | Yes | -- | Feishu/Lark channel adapter |
-| `web` | **No** | axum | Built-in Web UI and HTTP API |
+| `web` | Yes | axum | Built-in Web UI and HTTP API |
 | `all` | No | all above | Convenience: enables all features including `web` |
 | `sqlite-vec` | No | sqlite-vec | Semantic memory with vector search |
 
-> **Important:** The `web` feature is deliberately excluded from defaults because it embeds pre-built frontend assets (`web/dist/`) at compile time via `include_dir!`. Crate consumers don't have these assets. If you need the Web UI, build from source with `--features all`.
+> **Important:** The default build includes the `web` feature and embeds pre-built frontend assets from `web/dist/` at compile time via `include_dir!`. If `web/dist/` is missing, build the frontend first with `pnpm --dir web install && pnpm --dir web build`.
 
 **Minimal SDK usage (no channels, no web):**
 
@@ -168,10 +168,10 @@ async fn main() -> anyhow::Result<()> {
 rayclaw = { version = "0.1", features = ["telegram", "discord"] }
 ```
 
-**Local binary build (all features + Web UI):**
+**Local binary build (default features, including Web UI):**
 
 ```sh
-cargo build --release --features all
+cargo build --release
 ```
 
 ## How it works

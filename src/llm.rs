@@ -865,6 +865,30 @@ pub struct OpenAiProvider {
     idle_timeout: std::time::Duration,
 }
 
+fn openai_compat_user_agent() -> String {
+    "openai/go 3.22.0".to_string()
+}
+
+fn default_openai_compat_base_url(provider: &str) -> &'static str {
+    match provider.trim().to_lowercase().as_str() {
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "ollama" => "http://127.0.0.1:11434/v1",
+        "google" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        "alibaba" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "deepseek" => "https://api.deepseek.com/v1",
+        "moonshot" => "https://api.moonshot.cn/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+        "minimax" => "https://api.minimax.io/v1",
+        "cohere" => "https://api.cohere.ai/compatibility/v1",
+        "tencent" => "https://api.hunyuan.cloud.tencent.com/v1",
+        "xai" => "https://api.x.ai/v1",
+        "huggingface" => "https://router.huggingface.co/v1",
+        "together" => "https://api.together.xyz/v1",
+        _ => "https://api.openai.com/v1",
+    }
+}
+
 fn resolve_openai_compat_base(provider: &str, configured_base: &str) -> String {
     let trimmed = configured_base.trim().trim_end_matches('/').to_string();
     if is_openai_codex_provider(provider) {
@@ -875,7 +899,7 @@ fn resolve_openai_compat_base(provider: &str, configured_base: &str) -> String {
     }
 
     if trimmed.is_empty() {
-        "https://api.openai.com/v1".to_string()
+        default_openai_compat_base_url(provider).to_string()
     } else {
         trimmed
     }
@@ -901,7 +925,10 @@ impl OpenAiProvider {
         };
 
         OpenAiProvider {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .user_agent(openai_compat_user_agent())
+                .build()
+                .expect("failed to build OpenAI-compatible HTTP client"),
             api_key,
             codex_account_id,
             model: config.model.clone(),
@@ -2197,6 +2224,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2257,6 +2285,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2382,6 +2411,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2546,6 +2576,7 @@ mod tests {
             timezone: "UTC".into(),
             allowed_groups: vec![],
             control_chat_ids: vec![],
+            allow_global_memory_from_any_chat: false,
             max_session_messages: 40,
             compact_keep_recent: 20,
             discord_bot_token: None,
@@ -2833,6 +2864,18 @@ mod tests {
             std::env::remove_var("CODEX_HOME");
         }
         let _ = std::fs::remove_dir(temp);
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_openrouter() {
+        let base = resolve_openai_compat_base("openrouter", "");
+        assert_eq!(base, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn test_resolve_openai_compat_base_defaults_ollama() {
+        let base = resolve_openai_compat_base("ollama", "");
+        assert_eq!(base, "http://127.0.0.1:11434/v1");
     }
 
     #[test]

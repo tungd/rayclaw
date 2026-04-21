@@ -5,10 +5,14 @@
 # ──────────────────────────────────────────────────────
 
 # ── Telegram ────────────────────────────────────────
-# Token from @BotFather
-telegram_bot_token: ""
-# Bot username (without @)
-bot_username: ""
+# Configure Telegram inside channels.telegram to avoid duplicate legacy fields.
+# Disable BotFather privacy mode with /setprivacy if you want non-mention group messages.
+# channels:
+#   telegram:
+#     bot_token: ""
+#     bot_username: ""               # optional if respond_to_all_messages is true
+#     allowed_groups: []             # optional allowlist
+#     respond_to_all_messages: false # set true to answer every group/topic message
 
 # ── LLM provider ───────────────────────────────────
 # Supported: anthropic, openai, openai-codex, openrouter,
@@ -73,6 +77,8 @@ compact_keep_recent: 20         # messages to keep verbatim after compaction
 # allowed_groups: []
 # Control chats can operate across all chats (global memory, cross-chat send, etc.)
 # control_chat_ids: []
+# Opt-in: let any chat write global file memory. This is convenient but lowers isolation.
+# allow_global_memory_from_any_chat: false
 # Skip tool approval prompts (for isolated / sandboxed environments)
 # skip_tool_approval: false   # or set RAYCLAW_SKIP_TOOL_APPROVAL=true
 
