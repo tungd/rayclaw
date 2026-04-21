@@ -93,6 +93,7 @@ pub enum AgentEvent {
     Iteration {
         iteration: usize,
     },
+    ExternalDelivery,
     ToolStart {
         name: String,
     },
@@ -356,6 +357,7 @@ async fn maybe_handle_acp(
     chat_id: i64,
     override_prompt: Option<&str>,
     image_data: &Option<(String, String)>,
+    event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<Option<String>> {
     // Skip ACP routing for scheduler overrides and image messages
     if override_prompt.is_some() || image_data.is_some() {
@@ -517,10 +519,19 @@ async fn maybe_handle_acp(
 
             // Drop sender so the progress consumer task finishes
             drop(progress_tx);
-            let _ = progress_handle.await;
+            let progress_summary = progress_handle.await.ok().unwrap_or_default();
 
             match prompt_result {
-                Ok(result) => Ok(Some(result.forwarded_text())),
+                Ok(result) => {
+                    if progress_summary.forwarded_agent_text {
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(AgentEvent::ExternalDelivery);
+                        }
+                        Ok(Some(String::new()))
+                    } else {
+                        Ok(Some(result.forwarded_text()))
+                    }
+                }
                 Err(e) => Ok(Some(format!("ACP error: {e}"))),
             }
         } else {
@@ -530,61 +541,36 @@ async fn maybe_handle_acp(
     }
 }
 
-/// Spawn a background task that consumes ACP progress events and periodically
-/// sends status updates to the user's chat. Updates are throttled to at most
-/// once every 5 seconds to avoid flooding. `ToolStart` events are always sent
-/// immediately (debounced).
+/// Spawn a background task that relays ACP progress into the chat-facing
+/// callback pipeline: agent-authored text is forwarded quickly, while tool
+/// events are batched into periodic summaries.
 fn spawn_acp_progress_consumer(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::AcpProgressEvent>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::AcpProgressEvent>,
     registry: std::sync::Arc<crate::channel_adapter::ChannelRegistry>,
     db: std::sync::Arc<crate::db::Database>,
     bot_username: String,
     chat_id: i64,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        use crate::acp::AcpProgressEvent;
-        use std::time::Duration;
-        use tokio::time::Instant;
-
-        let throttle = Duration::from_secs(5);
-        let mut last_sent = Instant::now() - throttle; // allow immediate first send
-
-        while let Some(event) = rx.recv().await {
-            let now = Instant::now();
-            let msg = match &event {
-                AcpProgressEvent::ToolStart { name } => {
-                    if now.duration_since(last_sent) >= throttle {
-                        Some(format!("🔧 Running tool: {name}"))
-                    } else {
-                        None
-                    }
-                }
-                AcpProgressEvent::ToolComplete { name, status } => {
-                    if now.duration_since(last_sent) >= throttle {
-                        Some(format!("✅ {name}: {status}"))
-                    } else {
-                        None
-                    }
-                }
-                AcpProgressEvent::Thinking { .. } => None, // don't send thinking chunks
-            };
-
-            if let Some(text) = msg {
-                last_sent = Instant::now();
-                if let Err(e) = crate::channel::deliver_and_store_bot_message(
-                    &registry,
-                    db.clone(),
-                    &bot_username,
-                    chat_id,
-                    &text,
-                )
-                .await
-                {
-                    warn!("ACP progress delivery failed for chat {chat_id}: {e}");
-                }
+) -> tokio::task::JoinHandle<crate::acp::AcpProgressSummary> {
+    let callback: crate::acp::JobCompletionCallback = std::sync::Arc::new(move |chat_id, text| {
+        let registry = registry.clone();
+        let db = db.clone();
+        let bot_username = bot_username.clone();
+        Box::pin(async move {
+            if let Err(e) = crate::channel::deliver_and_store_bot_message(
+                &registry,
+                db,
+                &bot_username,
+                chat_id,
+                &text,
+            )
+            .await
+            {
+                warn!("ACP progress delivery failed for chat {chat_id}: {e}");
             }
-        }
-    })
+        })
+    });
+
+    crate::acp::spawn_progress_forwarder(rx, chat_id, callback)
 }
 
 pub(crate) async fn process_with_agent_impl(
@@ -616,7 +602,7 @@ pub(crate) async fn process_with_agent_impl(
     }
 
     // Handle ACP commands (#new, #end, etc.) and route to agent if session active
-    if let Some(reply) = maybe_handle_acp(state, chat_id, override_prompt, &image_data).await? {
+    if let Some(reply) = maybe_handle_acp(state, chat_id, override_prompt, &image_data, event_tx).await? {
         return Ok(reply);
     }
 

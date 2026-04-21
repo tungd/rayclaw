@@ -783,11 +783,16 @@ async fn handle_message(
             typing_handle.abort();
             drop(event_tx);
             let mut used_send_message_tool = false;
+            let mut external_delivery = false;
             while let Some(event) = event_rx.recv().await {
-                if let AgentEvent::ToolStart { name } = event {
-                    if name == "send_message" {
-                        used_send_message_tool = true;
+                match event {
+                    AgentEvent::ToolStart { name } => {
+                        if name == "send_message" {
+                            used_send_message_tool = true;
+                        }
                     }
+                    AgentEvent::ExternalDelivery => external_delivery = true,
+                    _ => {}
                 }
             }
 
@@ -812,9 +817,9 @@ async fn handle_message(
                 let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
             }
             // If response is empty, agent likely delivered via send_message tool directly.
-            else if used_send_message_tool {
+            else if used_send_message_tool || external_delivery {
                 info!(
-                    "Agent returned empty final response for chat {}; likely delivered via send_message tool",
+                    "Agent returned empty final response for chat {}; content was already delivered directly",
                     chat_id
                 );
             } else {

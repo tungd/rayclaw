@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::acp::{AcpManager, AcpPromptResult, JobCompletionCallback};
+use crate::acp::{AcpManager, AcpProgressSummary, AcpPromptResult, JobCompletionCallback};
 use crate::db::{call_blocking, Database, Memory};
 use crate::llm_types::ToolDefinition;
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ async fn prompt_with_progress_updates(
     timeout_secs: Option<u64>,
     chat_id: Option<i64>,
     progress_callback: Option<JobCompletionCallback>,
-) -> Result<AcpPromptResult, String> {
+) -> Result<(AcpPromptResult, AcpProgressSummary), String> {
     let (progress_tx, progress_handle) = match (chat_id, progress_callback) {
         (Some(cid), Some(cb)) => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::acp::AcpProgressEvent>();
@@ -41,10 +41,12 @@ async fn prompt_with_progress_updates(
         .prompt(session_id, message, timeout_secs, progress_tx.as_ref())
         .await;
     drop(progress_tx);
-    if let Some(handle) = progress_handle {
-        let _ = handle.await;
-    }
-    result
+    let progress_summary = if let Some(handle) = progress_handle {
+        handle.await.ok().unwrap_or_default()
+    } else {
+        AcpProgressSummary::default()
+    };
+    result.map(|result| (result, progress_summary))
 }
 
 /// Build all ACP tools sharing a single AcpManager.
@@ -366,7 +368,16 @@ impl Tool for AcpCodingTool {
             )
             .await
             {
-                Ok(result) => ToolResult::success(result.forwarded_text()),
+                Ok((result, progress_summary)) => {
+                    if progress_summary.forwarded_agent_text {
+                        ToolResult::success(
+                            "ACP agent response was streamed directly to the user. Do not repeat it verbatim; only add a brief note if needed."
+                                .to_string(),
+                        )
+                    } else {
+                        ToolResult::success(result.forwarded_text())
+                    }
+                }
                 Err(e) => ToolResult::error(format!("Coding agent error: {e}"))
                     .with_error_type("acp_error"),
             }
@@ -549,7 +560,16 @@ impl Tool for AcpPromptTool {
         )
         .await
         {
-            Ok(result) => ToolResult::success(result.forwarded_text()),
+            Ok((result, progress_summary)) => {
+                if progress_summary.forwarded_agent_text {
+                    ToolResult::success(
+                        "ACP agent response was streamed directly to the user. Do not repeat it verbatim; only add a brief note if needed."
+                            .to_string(),
+                    )
+                } else {
+                    ToolResult::success(result.forwarded_text())
+                }
+            }
             Err(e) => {
                 ToolResult::error(format!("ACP prompt failed: {e}")).with_error_type("acp_error")
             }

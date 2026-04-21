@@ -895,6 +895,11 @@ impl AcpConnection {
                                     .and_then(|t| t.as_str());
                                 if let Some(text) = text {
                                     message_buffer.push_str(text);
+                                    if let Some(tx) = progress_tx {
+                                        let _ = tx.send(AcpProgressEvent::AgentMessage {
+                                            text: text.to_string(),
+                                        });
+                                    }
                                 }
                             }
                             "agent_thought_chunk" => {
@@ -953,16 +958,18 @@ impl AcpConnection {
                                     "ACP [{}] tool update: id={tool_id} status={status}",
                                     self.agent_name
                                 );
-                                if let Some(tx) = progress_tx {
-                                    let tool_name = update
-                                        .and_then(|u| u.get("title"))
-                                        .and_then(|t| t.as_str())
-                                        .unwrap_or(tool_id)
-                                        .to_string();
-                                    let _ = tx.send(AcpProgressEvent::ToolComplete {
-                                        name: tool_name,
-                                        status: status.to_string(),
-                                    });
+                                if matches!(status, "completed" | "failed" | "cancelled") {
+                                    if let Some(tx) = progress_tx {
+                                        let tool_name = update
+                                            .and_then(|u| u.get("title"))
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or(tool_id)
+                                            .to_string();
+                                        let _ = tx.send(AcpProgressEvent::ToolComplete {
+                                            name: tool_name,
+                                            status: status.to_string(),
+                                        });
+                                    }
                                 }
                                 // Capture rawOutput (e.g. command stdout)
                                 if let Some(raw) = update.and_then(|u| u.get("rawOutput")) {
@@ -1059,6 +1066,8 @@ impl AcpConnection {
 /// Events emitted during ACP prompt execution for real-time progress reporting.
 #[derive(Debug, Clone)]
 pub enum AcpProgressEvent {
+    /// Agent-authored visible text chunk
+    AgentMessage { text: String },
     /// Agent started executing a tool
     ToolStart { name: String },
     /// Agent tool execution completed
@@ -1069,6 +1078,13 @@ pub enum AcpProgressEvent {
 
 /// Sender for streaming progress events during prompt execution.
 pub type AcpProgressSender = tokio::sync::mpsc::UnboundedSender<AcpProgressEvent>;
+
+/// Summary returned by a chat-facing progress relay.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcpProgressSummary {
+    pub forwarded_agent_text: bool,
+    pub sent_progress_updates: bool,
+}
 
 // ---------------------------------------------------------------------------
 // PTY connection — simple stdin/stdout subprocess for non-ACP CLI tools
@@ -1356,6 +1372,16 @@ impl AcpPromptResult {
             .join("\n\n")
     }
 
+    /// Return the final non-empty agent-authored message, if any.
+    pub fn latest_message_text(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find(|msg| !msg.trim().is_empty())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Best-effort user-facing text for chat forwarding.
     pub fn forwarded_text(&self) -> String {
         let text = self.agent_text();
@@ -1416,43 +1442,127 @@ pub type JobCompletionCallback = Arc<
         + Sync,
 >;
 
-/// Spawn a throttled progress forwarder that turns ACP progress events into
-/// short chat updates using the provided callback.
-pub fn spawn_progress_forwarder(
+fn format_progress_batch(events: &mut Vec<String>) -> Option<String> {
+    use std::collections::BTreeMap;
+
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut counts = BTreeMap::<String, usize>::new();
+    for event in events.drain(..) {
+        *counts.entry(event).or_insert(0) += 1;
+    }
+
+    let lines = counts
+        .into_iter()
+        .map(|(event, count)| {
+            if count > 1 {
+                format!("- {event} x{count}")
+            } else {
+                format!("- {event}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(format!("ACP progress update (last 30s):\n{lines}"))
+}
+
+fn spawn_progress_forwarder_with_interval(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
     callback: JobCompletionCallback,
-) -> tokio::task::JoinHandle<()> {
+    flush_interval: Duration,
+) -> tokio::task::JoinHandle<AcpProgressSummary> {
     tokio::spawn(async move {
-        let throttle = Duration::from_secs(5);
-        let mut last_sent = tokio::time::Instant::now() - throttle;
+        let mut tool_ticker = tokio::time::interval(flush_interval);
+        tool_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut agent_ticker = tokio::time::interval(Duration::from_millis(1200));
+        agent_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut summary = AcpProgressSummary::default();
+        let mut agent_buffer = String::new();
+        let mut tool_events = Vec::<String>::new();
 
-        while let Some(event) = rx.recv().await {
-            let now = tokio::time::Instant::now();
-            let text = match event {
-                AcpProgressEvent::ToolStart { name } => {
-                    if now.duration_since(last_sent) >= throttle {
-                        Some(format!("🔧 Running tool: {name}"))
-                    } else {
-                        None
-                    }
+        let flush_agent_buffer =
+            |buffer: &mut String| -> Option<String> {
+                if buffer.trim().is_empty() {
+                    buffer.clear();
+                    None
+                } else {
+                    Some(std::mem::take(buffer))
                 }
-                AcpProgressEvent::ToolComplete { name, status } => {
-                    if now.duration_since(last_sent) >= throttle {
-                        Some(format!("✅ {name}: {status}"))
-                    } else {
-                        None
-                    }
-                }
-                AcpProgressEvent::Thinking { .. } => None,
             };
 
-            if let Some(text) = text {
-                last_sent = tokio::time::Instant::now();
-                callback(chat_id, text).await;
+        loop {
+            tokio::select! {
+                _ = tool_ticker.tick() => {
+                    if let Some(text) = format_progress_batch(&mut tool_events) {
+                        summary.sent_progress_updates = true;
+                        callback(chat_id, text).await;
+                    }
+                }
+                _ = agent_ticker.tick() => {
+                    if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                        summary.forwarded_agent_text = true;
+                        callback(chat_id, text).await;
+                    }
+                }
+                maybe_event = rx.recv() => match maybe_event {
+                    Some(AcpProgressEvent::AgentMessage { text }) => {
+                        if let Some(summary_text) = format_progress_batch(&mut tool_events) {
+                            summary.sent_progress_updates = true;
+                            callback(chat_id, summary_text).await;
+                        }
+                        agent_buffer.push_str(&text);
+                        if agent_buffer.len() >= 1200 {
+                            if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                                summary.forwarded_agent_text = true;
+                                callback(chat_id, text).await;
+                            }
+                        }
+                    }
+                    Some(AcpProgressEvent::ToolStart { name }) => {
+                        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                            summary.forwarded_agent_text = true;
+                            callback(chat_id, text).await;
+                        }
+                        tool_events.push(format!("started `{name}`"));
+                    }
+                    Some(AcpProgressEvent::ToolComplete { name, status }) => {
+                        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                            summary.forwarded_agent_text = true;
+                            callback(chat_id, text).await;
+                        }
+                        tool_events.push(format!("finished `{name}` with status `{status}`"));
+                    }
+                    Some(AcpProgressEvent::Thinking { .. }) => {}
+                    None => break,
+                }
             }
         }
+
+        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+            summary.forwarded_agent_text = true;
+            callback(chat_id, text).await;
+        }
+        if let Some(text) = format_progress_batch(&mut tool_events) {
+            summary.sent_progress_updates = true;
+            callback(chat_id, text).await;
+        }
+
+        summary
     })
+}
+
+/// Spawn a progress forwarder that quickly relays agent-authored text
+/// while batching tool events into 30-second summaries.
+pub fn spawn_progress_forwarder(
+    rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
+    chat_id: i64,
+    callback: JobCompletionCallback,
+) -> tokio::task::JoinHandle<AcpProgressSummary> {
+    spawn_progress_forwarder_with_interval(rx, chat_id, callback, Duration::from_secs(30))
 }
 
 /// An active ACP agent session with its connection
@@ -1483,7 +1593,7 @@ pub struct AcpSession {
 
 pub struct AcpManager {
     pub config: AcpConfig,
-    sessions: RwLock<HashMap<String, Mutex<AcpSession>>>,
+    sessions: RwLock<HashMap<String, Arc<Mutex<AcpSession>>>>,
     /// Map chat_id → session_id for command-based ACP routing
     chat_sessions: RwLock<HashMap<i64, String>>,
     /// Per-agent active session count for enforcing max_per_agent
@@ -1668,7 +1778,7 @@ impl AcpManager {
         self.sessions
             .write()
             .await
-            .insert(session_id, Mutex::new(session));
+            .insert(session_id, Arc::new(Mutex::new(session)));
 
         // Increment per-agent session counter
         *self
@@ -1698,10 +1808,13 @@ impl AcpManager {
         timeout_secs: Option<u64>,
         progress_tx: Option<&AcpProgressSender>,
     ) -> Result<AcpPromptResult, String> {
-        let sessions = self.sessions.read().await;
-        let session_mutex = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("ACP session '{session_id}' not found"))?;
+        let session_mutex = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| format!("ACP session '{session_id}' not found"))?
+        };
 
         let mut session = session_mutex.lock().await;
         if session.status == SessionStatus::Ended {
@@ -1980,10 +2093,13 @@ impl AcpManager {
     ) -> Result<String, String> {
         // Validate session exists
         {
-            let sessions = self.sessions.read().await;
-            let session_mutex = sessions
-                .get(session_id)
-                .ok_or_else(|| format!("ACP session '{session_id}' not found"))?;
+            let session_mutex = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(session_id)
+                    .cloned()
+                    .ok_or_else(|| format!("ACP session '{session_id}' not found"))?
+            };
             let session = session_mutex.lock().await;
             if session.status == SessionStatus::Ended {
                 return Err(format!("ACP session '{session_id}' has ended"));
@@ -2006,8 +2122,10 @@ impl AcpManager {
 
         // Look up agent_id for the job record
         let agent_id = {
-            let sessions = self.sessions.read().await;
-            let session_mutex = sessions.get(session_id).unwrap();
+            let session_mutex = {
+                let sessions = self.sessions.read().await;
+                sessions.get(session_id).cloned().unwrap()
+            };
             let session = session_mutex.lock().await;
             session.agent_id.clone()
         };
@@ -2051,15 +2169,26 @@ impl AcpManager {
                 .prompt(&sid, &msg, timeout_secs, progress_tx.as_ref())
                 .await;
             drop(progress_tx);
-            if let Some(handle) = progress_handle {
-                let _ = handle.await;
-            }
+            let progress_summary = if let Some(handle) = progress_handle {
+                handle.await.ok().unwrap_or_default()
+            } else {
+                AcpProgressSummary::default()
+            };
             let now = chrono::Utc::now();
 
             // Format notification text before updating job store
             let notification = match &result {
-                Ok(r) => r.forwarded_text(),
-                Err(e) => format!("ACP job failed: {e}"),
+                Ok(_) if progress_summary.forwarded_agent_text => None,
+                Ok(r) if progress_summary.sent_progress_updates => {
+                    let final_text = r.latest_message_text();
+                    Some(if final_text.trim().is_empty() {
+                        r.forwarded_text()
+                    } else {
+                        final_text
+                    })
+                }
+                Ok(r) => Some(r.forwarded_text()),
+                Err(e) => Some(format!("ACP job failed: {e}")),
             };
 
             // Update job record
@@ -2082,7 +2211,8 @@ impl AcpManager {
             }
 
             // Fire completion callback
-            if let (Some(cid), Some(cb)) = (chat_id, on_complete) {
+            if let (Some(cid), Some(cb), Some(notification)) = (chat_id, on_complete, notification)
+            {
                 cb(cid, notification).await;
             }
 
@@ -3107,6 +3237,10 @@ mod tests {
     async fn test_progress_events_sent_via_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
 
+        tx.send(AcpProgressEvent::AgentMessage {
+            text: "hello".to_string(),
+        })
+        .unwrap();
         tx.send(AcpProgressEvent::ToolStart {
             name: "bash".to_string(),
         })
@@ -3127,14 +3261,59 @@ mod tests {
             events.push(e);
         }
 
-        assert_eq!(events.len(), 3);
-        assert!(matches!(&events[0], AcpProgressEvent::ToolStart { name } if name == "bash"));
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], AcpProgressEvent::AgentMessage { text } if text == "hello"));
+        assert!(matches!(&events[1], AcpProgressEvent::ToolStart { name } if name == "bash"));
         assert!(
-            matches!(&events[1], AcpProgressEvent::ToolComplete { name, status } if name == "bash" && status == "success")
+            matches!(&events[2], AcpProgressEvent::ToolComplete { name, status } if name == "bash" && status == "success")
         );
         assert!(
-            matches!(&events[2], AcpProgressEvent::Thinking { text } if text == "analyzing...")
+            matches!(&events[3], AcpProgressEvent::Thinking { text } if text == "analyzing...")
         );
+    }
+
+    #[tokio::test]
+    async fn test_progress_forwarder_replays_agent_text_and_batches_tool_updates() {
+        let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delivered_for_cb = delivered.clone();
+        let callback: JobCompletionCallback = Arc::new(move |_chat_id, text| {
+            let delivered = delivered_for_cb.clone();
+            Box::pin(async move {
+                delivered.lock().await.push(text);
+            })
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
+        let handle = spawn_progress_forwarder(rx, 42, callback);
+
+        tx.send(AcpProgressEvent::ToolStart {
+            name: "bash".to_string(),
+        })
+        .unwrap();
+        tx.send(AcpProgressEvent::ToolComplete {
+            name: "bash".to_string(),
+            status: "success".to_string(),
+        })
+        .unwrap();
+        tx.send(AcpProgressEvent::AgentMessage {
+            text: "Part one".to_string(),
+        })
+        .unwrap();
+        tx.send(AcpProgressEvent::AgentMessage {
+            text: "\nPart two".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let summary = handle.await.unwrap();
+        let delivered = delivered.lock().await.clone();
+
+        assert!(summary.forwarded_agent_text);
+        assert!(summary.sent_progress_updates);
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered[0].contains("started `bash`"));
+        assert!(delivered[0].contains("finished `bash` with status `success`"));
+        assert_eq!(delivered[1], "Part one\nPart two");
     }
 
     #[tokio::test]

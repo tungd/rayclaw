@@ -1085,6 +1085,16 @@ async fn api_send_stream(
                             )
                             .await;
                     }
+                    AgentEvent::ExternalDelivery => {
+                        run_hub
+                            .publish(
+                                &run_id_for_events,
+                                "status",
+                                json!({"message": "content delivered directly"}).to_string(),
+                                run_history_limit,
+                            )
+                            .await;
+                    }
                     AgentEvent::ToolStart { name } => {
                         run_hub
                             .publish(
@@ -1749,6 +1759,9 @@ async fn api_acp_prompt_stream(
         // Stream progress events
         while let Some(event) = progress_rx.recv().await {
             let data = match &event {
+                AcpProgressEvent::AgentMessage { text } => json!({
+                    "type": "agent_message", "text": text
+                }),
                 AcpProgressEvent::ToolStart { name } => json!({
                     "type": "tool_start", "name": name
                 }),
