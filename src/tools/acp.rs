@@ -327,6 +327,7 @@ impl Tool for AcpCodingTool {
         ToolDefinition {
             name: "acp_coding".into(),
             description: "Delegate a coding task to an external AI coding agent (for example Codex or Claude Code). \
+                Prefer this for repository/project coding work instead of long direct bash/read_file exploration loops. \
                 Automatically manages sessions: reuses existing session for the chat or creates a new one. \
                 If agent is omitted, it resolves the best agent from chat memory/context. \
                 Sends immediate notification to the user, then executes the task. \

@@ -20,6 +20,8 @@ use crate::runtime::AppState;
 use crate::text::floor_char_boundary;
 use crate::usage::build_usage_report;
 
+const TELEGRAM_GENERAL_FORUM_THREAD_ID: ThreadId = ThreadId(MessageId(1));
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramChannelConfig {
     pub bot_token: String,
@@ -49,6 +51,22 @@ fn telegram_conversation_thread_id(
         thread_id
     } else {
         None
+    }
+}
+
+fn telegram_delivery_thread_id(
+    is_forum_supergroup: bool,
+    is_topic_message: bool,
+    thread_id: Option<ThreadId>,
+) -> Option<ThreadId> {
+    if is_forum_supergroup {
+        if is_topic_message {
+            thread_id
+        } else {
+            Some(TELEGRAM_GENERAL_FORUM_THREAD_ID)
+        }
+    } else {
+        thread_id
     }
 }
 
@@ -300,15 +318,32 @@ async fn handle_message(
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let raw_chat_id = msg.chat.id.0;
+    let is_forum_supergroup = matches!(
+        &msg.chat.kind,
+        teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
+            kind: teloxide::types::PublicChatKind::Supergroup(
+                teloxide::types::PublicChatSupergroup { is_forum: true, .. }
+            ),
+            ..
+        })
+    );
     let conversation_thread_id =
         telegram_conversation_thread_id(msg.is_topic_message, msg.thread_id);
     let reply_target = TelegramTarget {
         chat_id: msg.chat.id,
-        thread_id: conversation_thread_id,
+        thread_id: telegram_delivery_thread_id(
+            is_forum_supergroup,
+            msg.is_topic_message,
+            msg.thread_id,
+        ),
     };
     let typing_target = TelegramTarget {
         chat_id: msg.chat.id,
-        thread_id: msg.thread_id,
+        thread_id: telegram_delivery_thread_id(
+            is_forum_supergroup,
+            msg.is_topic_message,
+            msg.thread_id,
+        ),
     };
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
@@ -329,10 +364,11 @@ async fn handle_message(
     let external_chat_id = format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
     let telegram_cfg = telegram_runtime_config(&state);
     debug!(
-        "Telegram routing chat_id={} raw_thread_id={:?} is_topic_message={} conversation_thread_id={:?} typing_thread_id={:?}",
+        "Telegram routing chat_id={} raw_thread_id={:?} is_topic_message={} is_forum_supergroup={} conversation_thread_id={:?} typing_thread_id={:?}",
         raw_chat_id,
         msg.thread_id,
         msg.is_topic_message,
+        is_forum_supergroup,
         conversation_thread_id,
         typing_target.thread_id
     );
@@ -1666,6 +1702,25 @@ mod tests {
             telegram_conversation_thread_id(false, general_thread_id),
             None
         );
+    }
+
+    #[test]
+    fn test_telegram_delivery_thread_id_targets_general_forum_topic() {
+        assert_eq!(
+            telegram_delivery_thread_id(true, false, None),
+            Some(ThreadId(MessageId(1)))
+        );
+    }
+
+    #[test]
+    fn test_telegram_delivery_thread_id_keeps_regular_forum_topic() {
+        let thread_id = Some(ThreadId(MessageId(42)));
+        assert_eq!(telegram_delivery_thread_id(true, true, thread_id), thread_id);
+    }
+
+    #[test]
+    fn test_telegram_delivery_thread_id_keeps_non_forum_chat_unthreaded() {
+        assert_eq!(telegram_delivery_thread_id(false, false, None), None);
     }
 
     #[test]

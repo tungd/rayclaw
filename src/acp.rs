@@ -1533,7 +1533,7 @@ fn format_progress_batch(events: &mut Vec<String>) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    Some(format!("ACP progress update (last 30s):\n{lines}"))
+    Some(lines)
 }
 
 fn agent_buffer_looks_complete(buffer: &str) -> bool {
