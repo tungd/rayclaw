@@ -38,6 +38,7 @@ struct LoopDetector {
 
 #[derive(Debug, Clone)]
 struct ToolCallRecord {
+    iteration: usize,
     hash: u64,
     name: String,
     is_error: bool,
@@ -55,6 +56,7 @@ impl LoopDetector {
     /// Record a tool call. Returns `true` if a loop is detected.
     fn record(
         &mut self,
+        iteration: usize,
         name: &str,
         input: &serde_json::Value,
         is_error: bool,
@@ -63,6 +65,7 @@ impl LoopDetector {
     ) -> bool {
         let hash = hash_tool_call(name, input);
         self.history.push(ToolCallRecord {
+            iteration,
             hash,
             name: name.to_string(),
             is_error,
@@ -108,11 +111,7 @@ impl LoopDetector {
         let Some(latest) = self.history.last() else {
             return false;
         };
-        self.history
-            .iter()
-            .rev()
-            .take_while(|call| call.name == latest.name)
-            .count()
+        self.trailing_distinct_iteration_count(|call| call.name == latest.name)
             >= self.same_tool_streak_limit()
     }
 
@@ -124,11 +123,7 @@ impl LoopDetector {
         if !latest.is_error {
             return false;
         }
-        self.history
-            .iter()
-            .rev()
-            .take_while(|call| call.name == latest.name && call.is_error)
-            .count()
+        self.trailing_distinct_iteration_count(|call| call.name == latest.name && call.is_error)
             >= self.failed_tool_streak_limit()
     }
 
@@ -137,17 +132,17 @@ impl LoopDetector {
         let Some(latest) = self.history.last() else {
             return false;
         };
+        if !latest.is_error {
+            return false;
+        }
         let Some(signature) = latest.error_signature.as_deref() else {
             return false;
         };
-        self.history
-            .iter()
-            .rev()
-            .take_while(|call| {
-                call.name == latest.name && call.error_signature.as_deref() == Some(signature)
-            })
-            .count()
-            >= self.failed_tool_streak_limit()
+        self.trailing_distinct_iteration_count(|call| {
+            call.name == latest.name
+                && call.is_error
+                && call.error_signature.as_deref() == Some(signature)
+        }) >= self.failed_tool_streak_limit()
     }
 
     fn same_tool_streak_limit(&self) -> usize {
@@ -160,6 +155,26 @@ impl LoopDetector {
 
     fn history_limit(&self) -> usize {
         self.same_tool_streak_limit().max(self.failed_tool_streak_limit()) * 4
+    }
+
+    fn trailing_distinct_iteration_count(
+        &self,
+        mut predicate: impl FnMut(&ToolCallRecord) -> bool,
+    ) -> usize {
+        let mut count = 0;
+        let mut last_iteration = None;
+
+        for call in self.history.iter().rev() {
+            if !predicate(call) {
+                break;
+            }
+            if last_iteration != Some(call.iteration) {
+                count += 1;
+                last_iteration = Some(call.iteration);
+            }
+        }
+
+        count
     }
 }
 
@@ -1193,6 +1208,7 @@ pub(crate) async fn process_with_agent_impl(
                         });
                     }
                     if loop_detector.record(
+                        iteration + 1,
                         name,
                         input,
                         result.is_error,
@@ -1619,6 +1635,7 @@ ACP coding guidance:
 - Use `acp_coding` for software engineering work in a project or repository when the task is likely to require multiple reads/edits/commands/tests.
 - Prefer `acp_coding` over long sequences of direct `bash`/`read_file` calls when the user wants coding help, debugging, refactors, code review, implementation, or "continue work" in an existing project.
 - If chat memory already captures a preferred coding agent (for example Codex for school/personal or Claude for work), omit the `agent` parameter and let `acp_coding` resolve it from memory.
+- If `acp_coding` reports that the coding agent already delivered its visible response directly to the user, treat the task as complete and do not retry the same ACP call unless the user asks for more work.
 - The chat commands `#new`, `#end`, `#agents`, `#sessions`, `#help` are handled by the runtime when the user invokes them directly.
 
 Browser automation guidance:
@@ -2883,6 +2900,7 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         // Different tool calls — no loop
         assert!(!det.record(
+            1,
             "read_file",
             &serde_json::json!({"path": "a.rs"}),
             false,
@@ -2890,6 +2908,7 @@ mod tests {
             "",
         ));
         assert!(!det.record(
+            1,
             "write_file",
             &serde_json::json!({"path": "b.rs"}),
             false,
@@ -2897,6 +2916,7 @@ mod tests {
             "",
         ));
         assert!(!det.record(
+            1,
             "bash",
             &serde_json::json!({"command": "ls"}),
             false,
@@ -2909,9 +2929,9 @@ mod tests {
     fn test_loop_detector_exact_single_repeat() {
         let mut det = super::LoopDetector::new(3);
         let input = serde_json::json!({"path": "/tmp/x"});
-        assert!(!det.record("read_file", &input, false, None, "")); // 1st
-        assert!(!det.record("read_file", &input, false, None, "")); // 2nd
-        assert!(det.record("read_file", &input, false, None, "")); // 3rd → loop!
+        assert!(!det.record(1, "read_file", &input, false, None, "")); // 1st
+        assert!(!det.record(2, "read_file", &input, false, None, "")); // 2nd
+        assert!(det.record(3, "read_file", &input, false, None, "")); // 3rd → loop!
     }
 
     #[test]
@@ -2919,31 +2939,31 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         let a = serde_json::json!({"path": "a"});
         let b = serde_json::json!({"path": "b"});
-        assert!(!det.record("read_file", &a, false, None, "")); // A
-        assert!(!det.record("write_file", &b, false, None, "")); // B
-        assert!(!det.record("read_file", &a, false, None, "")); // A
-        assert!(!det.record("write_file", &b, false, None, "")); // B
-        assert!(!det.record("read_file", &a, false, None, "")); // A
-        assert!(det.record("write_file", &b, false, None, "")); // B → pattern [A,B] × 3 detected
+        assert!(!det.record(1, "read_file", &a, false, None, "")); // A
+        assert!(!det.record(1, "write_file", &b, false, None, "")); // B
+        assert!(!det.record(2, "read_file", &a, false, None, "")); // A
+        assert!(!det.record(2, "write_file", &b, false, None, "")); // B
+        assert!(!det.record(3, "read_file", &a, false, None, "")); // A
+        assert!(det.record(3, "write_file", &b, false, None, "")); // B → pattern [A,B] × 3 detected
     }
 
     #[test]
     fn test_loop_detector_different_params_no_loop() {
         let mut det = super::LoopDetector::new(3);
         // Same tool but different params — not an exact loop
-        assert!(!det.record("read_file", &serde_json::json!({"path": "a"}), false, None, ""));
-        assert!(!det.record("read_file", &serde_json::json!({"path": "b"}), false, None, ""));
-        assert!(!det.record("read_file", &serde_json::json!({"path": "c"}), false, None, ""));
+        assert!(!det.record(1, "read_file", &serde_json::json!({"path": "a"}), false, None, ""));
+        assert!(!det.record(2, "read_file", &serde_json::json!({"path": "b"}), false, None, ""));
+        assert!(!det.record(3, "read_file", &serde_json::json!({"path": "c"}), false, None, ""));
     }
 
     #[test]
     fn test_loop_detector_threshold_4() {
         let mut det = super::LoopDetector::new(4);
         let input = serde_json::json!({"x": 1});
-        assert!(!det.record("tool", &input, false, None, "")); // 1
-        assert!(!det.record("tool", &input, false, None, "")); // 2
-        assert!(!det.record("tool", &input, false, None, "")); // 3
-        assert!(det.record("tool", &input, false, None, "")); // 4 → loop with threshold=4
+        assert!(!det.record(1, "tool", &input, false, None, "")); // 1
+        assert!(!det.record(2, "tool", &input, false, None, "")); // 2
+        assert!(!det.record(3, "tool", &input, false, None, "")); // 3
+        assert!(det.record(4, "tool", &input, false, None, "")); // 4 → loop with threshold=4
     }
 
     #[test]
@@ -2951,8 +2971,8 @@ mod tests {
         // Threshold 1 is clamped to 2
         let mut det = super::LoopDetector::new(1);
         let input = serde_json::json!({});
-        assert!(!det.record("tool", &input, false, None, "")); // 1
-        assert!(det.record("tool", &input, false, None, "")); // 2 → loop (min threshold=2)
+        assert!(!det.record(1, "tool", &input, false, None, "")); // 1
+        assert!(det.record(2, "tool", &input, false, None, "")); // 2 → loop (min threshold=2)
     }
 
     #[test]
@@ -2960,6 +2980,7 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         for idx in 0..11 {
             assert!(!det.record(
+                idx + 1,
                 "agent_browser",
                 &serde_json::json!({ "command": format!("step-{idx}") }),
                 false,
@@ -2968,6 +2989,7 @@ mod tests {
             ));
         }
         assert!(det.record(
+            12,
             "agent_browser",
             &serde_json::json!({ "command": "step-11" }),
             false,
@@ -2981,6 +3003,7 @@ mod tests {
         let mut det = super::LoopDetector::new(3);
         let input = serde_json::json!({"command": "snapshot -i"});
         assert!(!det.record(
+            1,
             "agent_browser",
             &input,
             true,
@@ -2988,6 +3011,7 @@ mod tests {
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
         ));
         assert!(!det.record(
+            2,
             "agent_browser",
             &input,
             true,
@@ -2995,12 +3019,73 @@ mod tests {
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
         ));
         assert!(det.record(
+            3,
             "agent_browser",
             &input,
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
         ));
+    }
+
+    #[test]
+    fn test_loop_detector_same_iteration_failed_batch_is_not_a_loop() {
+        let mut det = super::LoopDetector::new(3);
+        for url in ["https://a.example", "https://b.example", "https://c.example"] {
+            assert!(!det.record(
+                1,
+                "web_fetch",
+                &serde_json::json!({ "url": url }),
+                true,
+                Some("http_error"),
+                "Failed to fetch URL: HTTP 403 Forbidden",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_loop_detector_search_refinement_across_iterations_is_not_a_loop() {
+        let mut det = super::LoopDetector::new(3);
+        let searches = [
+            (
+                1,
+                "\"báo cáo\" \"phân tích kinh doanh\" filetype:pdf site:edu.vn",
+            ),
+            (
+                1,
+                "báo cáo bài tập lớn phân tích kinh doanh BSC KPI PDF",
+            ),
+            (
+                2,
+                "mẫu báo cáo phân tích kinh doanh doanh nghiệp Việt Nam PDF",
+            ),
+            (
+                2,
+                "\"phân tích kinh doanh\" \"bài tập lớn\" \"báo cáo\" -studocu",
+            ),
+            (3, "báo cáo phân tích kinh doanh Vinacafe BSC"),
+            (3, "báo cáo phân tích kinh doanh PNJ KPI BSC"),
+        ];
+
+        for (idx, (iteration, query)) in searches.into_iter().enumerate() {
+            let tripped = det.record(
+                iteration,
+                "web_search",
+                &serde_json::json!({ "query": query }),
+                false,
+                None,
+                "No results found.",
+            );
+            assert!(
+                !tripped,
+                "tripped at step {} exact={} same_tool={} failed={} repeated_error={}",
+                idx + 1,
+                det.detect_exact_loop(),
+                det.detect_same_tool_loop(),
+                det.detect_failed_tool_loop(),
+                det.detect_repeated_error_loop(),
+            );
+        }
     }
 
     #[test]

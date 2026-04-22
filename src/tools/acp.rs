@@ -23,6 +23,46 @@ fn progress_callback_from_notify(notify: Option<&NotifyFn>) -> Option<JobComplet
     })
 }
 
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "(no visible agent text captured)".to_string();
+    }
+
+    let mut preview = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn direct_delivery_completion_message(tool_name: &str, result: &AcpPromptResult) -> String {
+    let preview = truncate_preview(&result.latest_message_text(), 240);
+    let file_note = if result.files_changed.is_empty() {
+        "No file changes were reported.".to_string()
+    } else {
+        format!(
+            "Reported file changes: {}.",
+            result
+                .files_changed
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let reset_note = if result.context_reset {
+        " The ACP session was restarted before this run, so earlier ACP-only context was reset."
+    } else {
+        ""
+    };
+
+    format!(
+        "ACP task completed successfully. The coding agent's visible response was already delivered directly to the user in chat. Treat this request as complete and do not call `{tool_name}` again for the same instruction unless the user explicitly asks for more work.{reset_note} Latest agent message preview: {preview}. {file_note}"
+    )
+}
+
 async fn prompt_with_progress_updates(
     manager: &Arc<AcpManager>,
     session_id: &str,
@@ -332,6 +372,7 @@ impl Tool for AcpCodingTool {
                 If agent is omitted, it resolves the best agent from chat memory/context. \
                 Sends immediate notification to the user, then executes the task. \
                 For quick tasks the result is returned directly. \
+                If the agent response is streamed directly to the chat, treat that as completion and do not retry the same task automatically. \
                 Set async=true for long-running tasks to get a job_id and receive results via push notification."
                 .into(),
             input_schema: schema_object(
@@ -499,10 +540,10 @@ impl Tool for AcpCodingTool {
             {
                 Ok((result, progress_summary)) => {
                     if progress_summary.forwarded_agent_text {
-                        ToolResult::success(
-                            "ACP agent response was streamed directly to the user. Do not repeat it verbatim; only add a brief note if needed."
-                                .to_string(),
-                        )
+                        ToolResult::success(direct_delivery_completion_message(
+                            "acp_coding",
+                            &result,
+                        ))
                     } else {
                         ToolResult::success(result.forwarded_text())
                     }
@@ -691,10 +732,7 @@ impl Tool for AcpPromptTool {
         {
             Ok((result, progress_summary)) => {
                 if progress_summary.forwarded_agent_text {
-                    ToolResult::success(
-                        "ACP agent response was streamed directly to the user. Do not repeat it verbatim; only add a brief note if needed."
-                            .to_string(),
-                    )
+                    ToolResult::success(direct_delivery_completion_message("acp_prompt", &result))
                 } else {
                     ToolResult::success(result.forwarded_text())
                 }
@@ -1105,6 +1143,26 @@ mod tests {
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-'));
         }
+    }
+
+    #[test]
+    fn test_direct_delivery_completion_message_discourages_retries() {
+        let result = AcpPromptResult {
+            messages: vec!["Implemented the fix and added tests.".to_string()],
+            tool_outputs: vec![],
+            tool_calls: vec![],
+            files_changed: vec!["src/tools/acp.rs".to_string()],
+            completed: true,
+            duration_ms: 1500,
+            context_reset: false,
+        };
+
+        let message = direct_delivery_completion_message("acp_coding", &result);
+        assert!(message.contains("completed successfully"));
+        assert!(message.contains("already delivered directly"));
+        assert!(message.contains("do not call `acp_coding` again"));
+        assert!(message.contains("src/tools/acp.rs"));
+        assert!(message.contains("Implemented the fix and added tests."));
     }
 
     #[test]
