@@ -2,6 +2,8 @@
 /target
 rayclaw.config.yaml
 rayclaw.config.yaml.*
+rayclaw-gateway-*.log
+rayclaw-gateway-*.error.log
 rayclaw.data/*
 !rayclaw.data/skills/
 !rayclaw.data/skills/**

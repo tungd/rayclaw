@@ -182,10 +182,12 @@ impl Tool for BrowserTool {
         let program = agent_browser_program();
         info!("Executing browser command via '{}'", program);
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new(&program).args(&args).output(),
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), {
+            let mut cmd = tokio::process::Command::new(&program);
+            cmd.args(&args);
+            cmd.kill_on_drop(true);
+            cmd.output()
+        })
         .await;
 
         match result {

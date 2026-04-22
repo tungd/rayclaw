@@ -1572,15 +1572,14 @@ fn spawn_progress_forwarder_with_interval(
         let mut agent_timer = std::pin::Pin::from(Box::new(tokio::time::sleep_until(far_future)));
         let mut agent_flush_armed = false;
 
-        let flush_agent_buffer =
-            |buffer: &mut String| -> Option<String> {
-                if buffer.trim().is_empty() {
-                    buffer.clear();
-                    None
-                } else {
-                    Some(std::mem::take(buffer))
-                }
-            };
+        let flush_agent_buffer = |buffer: &mut String| -> Option<String> {
+            if buffer.trim().is_empty() {
+                buffer.clear();
+                None
+            } else {
+                Some(std::mem::take(buffer))
+            }
+        };
 
         loop {
             tokio::select! {

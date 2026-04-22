@@ -76,7 +76,6 @@ impl LoopDetector {
             self.history.drain(..overflow);
         }
         self.detect_exact_loop()
-            || self.detect_same_tool_loop()
             || self.detect_failed_tool_loop()
             || self.detect_repeated_error_loop()
     }
@@ -104,15 +103,6 @@ impl LoopDetector {
             }
         }
         false
-    }
-
-    /// Detect a long streak of the same tool even when the parameters vary.
-    fn detect_same_tool_loop(&self) -> bool {
-        let Some(latest) = self.history.last() else {
-            return false;
-        };
-        self.trailing_distinct_iteration_count(|call| call.name == latest.name)
-            >= self.same_tool_streak_limit()
     }
 
     /// Detect repeated failures from the same tool.
@@ -145,16 +135,12 @@ impl LoopDetector {
         }) >= self.failed_tool_streak_limit()
     }
 
-    fn same_tool_streak_limit(&self) -> usize {
-        (self.threshold * 4).max(8)
-    }
-
     fn failed_tool_streak_limit(&self) -> usize {
         self.threshold.max(2)
     }
 
     fn history_limit(&self) -> usize {
-        self.same_tool_streak_limit().max(self.failed_tool_streak_limit()) * 4
+        (self.threshold * 4).max(self.failed_tool_streak_limit()) * 4
     }
 
     fn trailing_distinct_iteration_count(
@@ -183,7 +169,9 @@ fn error_signature(error_type: Option<&str>, content: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| {
-            !line.is_empty() && !line.eq_ignore_ascii_case("STDERR:") && !line.starts_with("Exit code")
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("STDERR:")
+                && !line.starts_with("Exit code")
         })
         .map(|line| {
             let mut clipped = line.chars().take(160).collect::<String>();
@@ -200,6 +188,44 @@ fn error_signature(error_type: Option<&str>, content: &str) -> Option<String> {
         (None, false) => Some(headline),
         (Some(kind), false) => Some(format!("{kind}:{headline}")),
     }
+}
+
+fn loop_failure_preview(content: &str) -> Option<String> {
+    let mut lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("STDERR:")
+                && !line.starts_with("Exit code")
+        })
+        .map(|line| {
+            let mut clipped = line.chars().take(160).collect::<String>();
+            if line.chars().count() > 160 {
+                clipped.push_str("...");
+            }
+            clipped
+        });
+
+    let collected = lines.by_ref().collect::<Vec<_>>();
+    if collected.is_empty() {
+        return None;
+    }
+
+    collected
+        .iter()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("not found")
+                || lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("denied")
+                || lower.contains("unknown")
+                || lower.contains("timeout")
+                || lower.contains("err_")
+        })
+        .cloned()
+        .or_else(|| collected.last().cloned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -722,7 +748,9 @@ pub(crate) async fn process_with_agent_impl(
     }
 
     // Handle ACP commands (#new, #end, etc.) and route to agent if session active
-    if let Some(reply) = maybe_handle_acp(state, chat_id, override_prompt, &image_data, event_tx).await? {
+    if let Some(reply) =
+        maybe_handle_acp(state, chat_id, override_prompt, &image_data, event_tx).await?
+    {
         return Ok(reply);
     }
 
@@ -743,6 +771,9 @@ pub(crate) async fn process_with_agent_impl(
                 db.get_new_user_messages_since(chat_id, &updated_at_cloned)
             })
             .await?;
+            if !new_msgs.is_empty() {
+                strip_stale_agent_browser_history(&mut session_messages);
+            }
             for stored_msg in &new_msgs {
                 let content = format_user_message(&stored_msg.sender_name, &stored_msg.content);
                 // Merge if last message is also from user
@@ -1160,6 +1191,7 @@ pub(crate) async fn process_with_agent_impl(
 
             let mut tool_results = Vec::new();
             let mut loop_detected_tool = None;
+            let mut loop_detected_error_preview = None;
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
                     if let Some(tx) = event_tx {
@@ -1216,6 +1248,10 @@ pub(crate) async fn process_with_agent_impl(
                         &result.content,
                     ) {
                         loop_detected_tool = Some(name.clone());
+                        loop_detected_error_preview = result
+                            .is_error
+                            .then(|| loop_failure_preview(&result.content))
+                            .flatten();
                     }
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -1237,9 +1273,15 @@ pub(crate) async fn process_with_agent_impl(
                     role: "user".into(),
                     content: MessageContent::Blocks(tool_results),
                 });
-                let loop_msg = format!(
-                    "I detected a repeating pattern in my `{loop_tool_name}` tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps."
-                );
+                let loop_msg = if let Some(error_preview) = loop_detected_error_preview {
+                    format!(
+                        "I stopped after repeated `{loop_tool_name}` failures to avoid an infinite loop. Last error: {error_preview}"
+                    )
+                } else {
+                    format!(
+                        "I detected a repeating pattern in my `{loop_tool_name}` tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps."
+                    )
+                };
                 messages.push(Message {
                     role: "assistant".into(),
                     content: MessageContent::Text(loop_msg.clone()),
@@ -1632,8 +1674,8 @@ Current chat_id: {chat_id}. Supply this to send_message, schedule, export_chat, 
 Permission scope: operations are restricted to the current chat unless it is listed as a control chat. Cross-chat attempts without authorization will be rejected by the tool layer.
 
 ACP coding guidance:
-- Use `acp_coding` for software engineering work in a project or repository when the task is likely to require multiple reads/edits/commands/tests.
-- Prefer `acp_coding` over long sequences of direct `bash`/`read_file` calls when the user wants coding help, debugging, refactors, code review, implementation, or "continue work" in an existing project.
+- Use `acp_coding` only when an external coding agent is clearly beneficial, such as long-running repository work or when the user explicitly wants delegated coding help.
+- Prefer direct `bash`/`read_file`/local tools for quick debugging, focused inspection, or small edits inside the current runtime.
 - If chat memory already captures a preferred coding agent (for example Codex for school/personal or Claude for work), omit the `agent` parameter and let `acp_coding` resolve it from memory.
 - If `acp_coding` reports that the coding agent already delivered its visible response directly to the user, treat the task as complete and do not retry the same ACP call unless the user asks for more work.
 - The chat commands `#new`, `#end`, `#agents`, `#sessions`, `#help` are handled by the runtime when the user invokes them directly.
@@ -1642,6 +1684,7 @@ Browser automation guidance:
 - Use `agent_browser` only when you need a real rendered webpage or interactive browser behavior.
 - Prefer `web_fetch` / `web_search` for plain web content retrieval, and prefer `bash`, file tools, or `acp_coding` for repository inspection, CLI checks, APIs, deployments, and coding work.
 - `agent_browser` is RayClaw's local browser tool backed by the `agent-browser` CLI, not a provider-native browsing capability.
+- Browser element refs like `@e12` are ephemeral. Never reuse refs from a previous user turn; after a new request or navigation, start with a fresh `snapshot -i`.
 
 # Operational guidelines
 
@@ -1654,8 +1697,8 @@ Browser automation guidance:
 - If `todo_read` returns tasks from a previous request that are no longer relevant, clear them with `todo_write` and create a fresh plan for the current request. Never blindly resume stale in_progress tasks.
 
 ## Delegation
-- For codebase-heavy work, delegate early with `acp_coding` instead of manually exploring the repository for many iterations.
-- Use direct `bash`/`read_file` exploration only for quick checks, narrow follow-ups, or when ACP is clearly unsuitable.
+- Use `acp_coding` selectively for bounded work that benefits from an external coding agent.
+- Prefer direct `bash`/`read_file` exploration for quick local investigation, debugging, and narrow follow-ups.
 - If a task clearly matches an available skill such as `coding-agent`, load it before proceeding.
 
 ## Memory
@@ -1831,6 +1874,44 @@ pub(crate) fn strip_images_for_session(messages: &mut [Message]) {
     }
 }
 
+/// Browser element refs are ephemeral. Strip prior `agent_browser` tool-use/result
+/// blocks before appending a fresh user turn so the model doesn't reuse stale `@eNN` refs.
+pub(crate) fn strip_stale_agent_browser_history(messages: &mut Vec<Message>) {
+    let mut browser_tool_use_ids = std::collections::HashSet::new();
+
+    for msg in messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            blocks.retain(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } if name == "agent_browser" => {
+                    browser_tool_use_ids.insert(id.clone());
+                    false
+                }
+                _ => true,
+            });
+        }
+    }
+
+    if browser_tool_use_ids.is_empty() {
+        return;
+    }
+
+    for msg in messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            blocks.retain(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    !browser_tool_use_ids.contains(tool_use_id)
+                }
+                _ => true,
+            });
+        }
+    }
+
+    messages.retain(|msg| match &msg.content {
+        MessageContent::Blocks(blocks) => !blocks.is_empty(),
+        _ => true,
+    });
+}
+
 /// Archive the full conversation to a markdown file before compaction.
 /// Saved to `<data_dir>/groups/<channel>/<chat_id>/conversations/<timestamp>.md`.
 pub fn archive_conversation(data_dir: &str, channel: &str, chat_id: i64, messages: &[Message]) {
@@ -1954,7 +2035,14 @@ fn truncate_tool_result_content(content: &str) -> String {
     let total_chars = content.chars().count();
     let omitted_chars = total_chars.saturating_sub(head_chars + tail_chars);
 
-    let head_end = floor_char_boundary(content, content.char_indices().nth(head_chars).map(|(i, _)| i).unwrap_or(content.len()));
+    let head_end = floor_char_boundary(
+        content,
+        content
+            .char_indices()
+            .nth(head_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(content.len()),
+    );
     let tail_start = content
         .char_indices()
         .nth(total_chars.saturating_sub(tail_chars))
@@ -1975,7 +2063,9 @@ fn approximate_request_body_bytes(
     messages: &[Message],
     tool_defs: &[ToolDefinition],
 ) -> usize {
-    let messages_bytes = serde_json::to_vec(messages).map(|v| v.len()).unwrap_or_default();
+    let messages_bytes = serde_json::to_vec(messages)
+        .map(|v| v.len())
+        .unwrap_or_default();
     let tool_bytes = serde_json::to_vec(tool_defs)
         .map(|v| v.len())
         .unwrap_or_default();
@@ -2179,7 +2269,8 @@ mod tests {
     use crate::error::RayClawError;
     use crate::llm::LlmProvider;
     use crate::llm_types::{
-        Message, MessageContent, MessagesResponse, ResponseContentBlock, ToolDefinition,
+        ContentBlock, Message, MessageContent, MessagesResponse, ResponseContentBlock,
+        ToolDefinition,
     };
     use crate::memory::MemoryManager;
     use crate::runtime::AppState;
@@ -2303,6 +2394,74 @@ mod tests {
         }
     }
 
+    struct RepeatingWriteMemoryLlm {
+        calls: Arc<AtomicUsize>,
+        chat_id: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RepeatingWriteMemoryLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = if idx < 2 {
+                MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: format!("mem_repeat_{idx}"),
+                        name: "write_memory".to_string(),
+                        input: serde_json::json!({
+                            "scope": "chat",
+                            "chat_id": self.chat_id,
+                            "content": "loop detector regression"
+                        }),
+                    }],
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: None,
+                }
+            } else {
+                MessagesResponse {
+                    content: vec![ResponseContentBlock::Text {
+                        text: "should not reach a third LLM turn".to_string(),
+                    }],
+                    stop_reason: Some("end_turn".to_string()),
+                    usage: None,
+                }
+            };
+            Ok(response)
+        }
+    }
+
+    struct BlockingGateLlm {
+        entered: Arc<AtomicUsize>,
+        barrier: Arc<tokio::sync::Barrier>,
+        entered_notify: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for BlockingGateLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.entered_notify.notify_waiters();
+            self.barrier.wait().await;
+            Ok(MessagesResponse {
+                content: vec![ResponseContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                usage: None,
+            })
+        }
+    }
+
     fn test_db() -> (Arc<Database>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("mc_agent_engine_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2389,6 +2548,8 @@ mod tests {
             tools: ToolRegistry::new(&cfg, channel_registry, db),
             acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config_file("")),
             chat_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            chat_runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            next_chat_run_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -2455,6 +2616,70 @@ mod tests {
         assert!(first_line.contains("用户喜欢咖啡和编程"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_strip_stale_agent_browser_history_removes_ephemeral_refs() {
+        let mut messages = vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "keep me".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "browser_1".into(),
+                        name: "agent_browser".into(),
+                        input: serde_json::json!({"command": "snapshot -i"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "bash_1".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({"command": "pwd"}),
+                    },
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "browser_1".into(),
+                        content: "- link [ref=e61]".into(),
+                        is_error: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "bash_1".into(),
+                        content: "/tmp".into(),
+                        is_error: None,
+                    },
+                ]),
+            },
+        ];
+
+        super::strip_stale_agent_browser_history(&mut messages);
+
+        match &messages[0].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(blocks[0], ContentBlock::Text { .. }));
+                assert!(matches!(
+                    blocks[1],
+                    ContentBlock::ToolUse { ref name, .. } if name == "bash"
+                ));
+            }
+            _ => panic!("expected block content"),
+        }
+
+        match &messages[1].content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(
+                    blocks[0],
+                    ContentBlock::ToolResult { ref tool_use_id, .. } if tool_use_id == "bash_1"
+                ));
+            }
+            _ => panic!("expected block content"),
+        }
     }
 
     #[tokio::test]
@@ -2726,6 +2951,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
+    #[tokio::test]
+    async fn test_two_identical_iterations_do_not_stop_agent_loop() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_repeated_iteration_loop_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let chat_id = 79;
+        let state = test_state_with_llm(
+            &base_dir,
+            Box::new(RepeatingWriteMemoryLlm {
+                calls: calls.clone(),
+                chat_id,
+            }),
+        );
+        store_user_message(&state.db, chat_id, "Save this note for later.");
+
+        let reply = process_with_agent(
+            &state,
+            AgentRequestContext {
+                caller_channel: "web",
+                chat_id,
+                chat_type: "web",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "should not reach a third LLM turn");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_telegram_general_and_topic_chats_run_in_parallel() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_telegram_parallel_topics_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let entered_notify = Arc::new(tokio::sync::Notify::new());
+        let state = test_state_with_llm(
+            &base_dir,
+            Box::new(BlockingGateLlm {
+                entered: entered.clone(),
+                barrier: barrier.clone(),
+                entered_notify: entered_notify.clone(),
+            }),
+        );
+
+        let general_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189",
+                Some("TD-Rayclaw"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        let topic_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("CareAI 247"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        assert_ne!(general_chat_id, topic_chat_id);
+
+        store_user_message(&state.db, general_chat_id, "general work");
+        store_user_message(&state.db, topic_chat_id, "topic work");
+
+        let general_state = state.clone();
+        let general_task = tokio::spawn(async move {
+            process_with_agent(
+                &general_state,
+                AgentRequestContext {
+                    caller_channel: "telegram",
+                    chat_id: general_chat_id,
+                    chat_type: "telegram_supergroup",
+                },
+                None,
+                None,
+            )
+            .await
+        });
+
+        let topic_state = state.clone();
+        let topic_task = tokio::spawn(async move {
+            process_with_agent(
+                &topic_state,
+                AgentRequestContext {
+                    caller_channel: "telegram",
+                    chat_id: topic_chat_id,
+                    chat_type: "telegram_supergroup",
+                },
+                None,
+                None,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                entered_notify.notified().await;
+            }
+        })
+        .await
+        .expect("general and topic chats should both reach the LLM without serializing");
+
+        barrier.wait().await;
+
+        assert_eq!(general_task.await.unwrap().unwrap(), "ok");
+        assert_eq!(topic_task.await.unwrap().unwrap(), "ok");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
     #[test]
     fn test_build_system_prompt_with_soul() {
         let soul = "I am a friendly pirate assistant. I speak in pirate lingo and love adventure.";
@@ -2746,7 +3099,8 @@ mod tests {
         assert!(prompt.contains("acp_coding"));
         assert!(prompt.contains("agent_browser"));
         assert!(prompt.contains("not a provider-native browsing capability"));
-        assert!(prompt.contains("Prefer `acp_coding` over long sequences of direct `bash`/`read_file` calls"));
+        assert!(prompt
+            .contains("Use `acp_coding` only when an external coding agent is clearly beneficial"));
         assert!(prompt.contains("If a task clearly matches an available skill such as `coding-agent`, load it before proceeding"));
     }
 
@@ -2931,7 +3285,7 @@ mod tests {
         let input = serde_json::json!({"path": "/tmp/x"});
         assert!(!det.record(1, "read_file", &input, false, None, "")); // 1st
         assert!(!det.record(2, "read_file", &input, false, None, "")); // 2nd
-        assert!(det.record(3, "read_file", &input, false, None, "")); // 3rd → loop!
+        assert!(det.record(3, "read_file", &input, false, None, "")); // 3rd → exact loop
     }
 
     #[test]
@@ -2944,16 +3298,83 @@ mod tests {
         assert!(!det.record(2, "read_file", &a, false, None, "")); // A
         assert!(!det.record(2, "write_file", &b, false, None, "")); // B
         assert!(!det.record(3, "read_file", &a, false, None, "")); // A
-        assert!(det.record(3, "write_file", &b, false, None, "")); // B → pattern [A,B] × 3 detected
+        assert!(det.record(3, "write_file", &b, false, None, "")); // B → pattern [A,B] × 3
+    }
+
+    #[test]
+    fn test_loop_detector_two_identical_iterations_are_not_a_loop() {
+        let mut det = super::LoopDetector::new(3);
+        let a = serde_json::json!({"path": "a"});
+        let b = serde_json::json!({"path": "b"});
+        assert!(!det.record(1, "read_file", &a, false, None, ""));
+        assert!(!det.record(1, "write_file", &b, false, None, ""));
+        assert!(!det.record(2, "read_file", &a, false, None, ""));
+        assert!(!det.record(2, "write_file", &b, false, None, ""));
+    }
+
+    #[test]
+    fn test_loop_detector_real_bash_repo_diagnosis_is_not_a_loop() {
+        let mut det = super::LoopDetector::new(3);
+        let bash_calls = [
+            "cd ~/Projects/careai && git status 2>&1",
+            "cd ~/Projects/careai && git diff --stat 2>&1",
+            "cd ~/Projects/careai && git diff 2>&1",
+            "cd ~/Projects/careai && git checkout -b fix/sidebar-avatar-images 2>&1",
+            "cd ~/Projects/careai && git add apps/client-pwa/src/components/atoms/Avatar.tsx apps/client-pwa/src/components/organisms/SidebarMenu.tsx apps/client-pwa/src/routes/history.tsx && git commit -m \"fix: show DiceBear avatar images in sidebar and fix image loading\" 2>&1",
+            "cd ~/Projects/careai && git push -u origin fix/sidebar-avatar-images 2>&1",
+            "cd ~/Projects/careai && git remote -v 2>&1",
+            "cd ~/Projects/careai && gh repo view --json owner,name 2>&1",
+            "gh auth status 2>&1",
+            "gh search repos \"monorepo\" --owner CareAI-247 2>&1; gh search repos \"monorepo\" --owner careai247 2>&1; gh search repos \"careai\" --owner CareAI-247 2>&1",
+            "cd ~/Projects/careai && cat .git/config 2>&1",
+            "gh api repos/CareAI-247/monorepo 2>&1 | head -5",
+            "gh api user/repos --paginate -q '.[] | select(.name | test(\"careai|monorepo\"; \"i\")) | .full_name' 2>&1",
+        ];
+
+        for (idx, command) in bash_calls.into_iter().enumerate() {
+            assert!(
+                !det.record(
+                    idx + 1,
+                    "bash",
+                    &serde_json::json!({ "command": command }),
+                    false,
+                    None,
+                    "Command completed with exit code 0",
+                ),
+                "recent repo-diagnosis bash command {} incorrectly tripped the loop detector",
+                idx + 1,
+            );
+        }
     }
 
     #[test]
     fn test_loop_detector_different_params_no_loop() {
         let mut det = super::LoopDetector::new(3);
         // Same tool but different params — not an exact loop
-        assert!(!det.record(1, "read_file", &serde_json::json!({"path": "a"}), false, None, ""));
-        assert!(!det.record(2, "read_file", &serde_json::json!({"path": "b"}), false, None, ""));
-        assert!(!det.record(3, "read_file", &serde_json::json!({"path": "c"}), false, None, ""));
+        assert!(!det.record(
+            1,
+            "read_file",
+            &serde_json::json!({"path": "a"}),
+            false,
+            None,
+            ""
+        ));
+        assert!(!det.record(
+            2,
+            "read_file",
+            &serde_json::json!({"path": "b"}),
+            false,
+            None,
+            ""
+        ));
+        assert!(!det.record(
+            3,
+            "read_file",
+            &serde_json::json!({"path": "c"}),
+            false,
+            None,
+            ""
+        ));
     }
 
     #[test]
@@ -2961,9 +3382,9 @@ mod tests {
         let mut det = super::LoopDetector::new(4);
         let input = serde_json::json!({"x": 1});
         assert!(!det.record(1, "tool", &input, false, None, "")); // 1
-        assert!(!det.record(2, "tool", &input, false, None, "")); // 2
-        assert!(!det.record(3, "tool", &input, false, None, "")); // 3
-        assert!(det.record(4, "tool", &input, false, None, "")); // 4 → loop with threshold=4
+        assert!(!det.record(1, "tool", &input, false, None, "")); // 2
+        assert!(!det.record(1, "tool", &input, false, None, "")); // 3
+        assert!(det.record(1, "tool", &input, false, None, "")); // 4 → exact loop with threshold=4
     }
 
     #[test]
@@ -2972,13 +3393,13 @@ mod tests {
         let mut det = super::LoopDetector::new(1);
         let input = serde_json::json!({});
         assert!(!det.record(1, "tool", &input, false, None, "")); // 1
-        assert!(det.record(2, "tool", &input, false, None, "")); // 2 → loop (min threshold=2)
+        assert!(det.record(1, "tool", &input, false, None, "")); // 2 → exact loop (min threshold=2)
     }
 
     #[test]
-    fn test_loop_detector_same_tool_streak_with_different_params() {
+    fn test_loop_detector_long_same_tool_streak_with_different_params_is_not_a_loop() {
         let mut det = super::LoopDetector::new(3);
-        for idx in 0..11 {
+        for idx in 0..20 {
             assert!(!det.record(
                 idx + 1,
                 "agent_browser",
@@ -2988,24 +3409,15 @@ mod tests {
                 "",
             ));
         }
-        assert!(det.record(
-            12,
-            "agent_browser",
-            &serde_json::json!({ "command": "step-11" }),
-            false,
-            None,
-            "",
-        ));
     }
 
     #[test]
     fn test_loop_detector_repeated_tool_failures() {
         let mut det = super::LoopDetector::new(3);
-        let input = serde_json::json!({"command": "snapshot -i"});
         assert!(!det.record(
             1,
             "agent_browser",
-            &input,
+            &serde_json::json!({"command": "snapshot -1"}),
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
@@ -3013,7 +3425,7 @@ mod tests {
         assert!(!det.record(
             2,
             "agent_browser",
-            &input,
+            &serde_json::json!({"command": "snapshot -2"}),
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
@@ -3021,7 +3433,7 @@ mod tests {
         assert!(det.record(
             3,
             "agent_browser",
-            &input,
+            &serde_json::json!({"command": "snapshot -3"}),
             true,
             Some("process_exit"),
             "Exit code 1\nSTDERR:\nSyntaxError: Invalid or unexpected token",
@@ -3029,9 +3441,24 @@ mod tests {
     }
 
     #[test]
+    fn test_loop_failure_preview_prefers_actionable_error_line() {
+        let preview = super::loop_failure_preview(
+            "Exit code 254\nundefined\nERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL Command \"wrangler\" not found\n",
+        );
+        assert_eq!(
+            preview.as_deref(),
+            Some("ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL Command \"wrangler\" not found")
+        );
+    }
+
+    #[test]
     fn test_loop_detector_same_iteration_failed_batch_is_not_a_loop() {
         let mut det = super::LoopDetector::new(3);
-        for url in ["https://a.example", "https://b.example", "https://c.example"] {
+        for url in [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ] {
             assert!(!det.record(
                 1,
                 "web_fetch",
@@ -3051,10 +3478,7 @@ mod tests {
                 1,
                 "\"báo cáo\" \"phân tích kinh doanh\" filetype:pdf site:edu.vn",
             ),
-            (
-                1,
-                "báo cáo bài tập lớn phân tích kinh doanh BSC KPI PDF",
-            ),
+            (1, "báo cáo bài tập lớn phân tích kinh doanh BSC KPI PDF"),
             (
                 2,
                 "mẫu báo cáo phân tích kinh doanh doanh nghiệp Việt Nam PDF",
@@ -3078,10 +3502,9 @@ mod tests {
             );
             assert!(
                 !tripped,
-                "tripped at step {} exact={} same_tool={} failed={} repeated_error={}",
+                "tripped at step {} exact={} failed={} repeated_error={}",
                 idx + 1,
                 det.detect_exact_loop(),
-                det.detect_same_tool_loop(),
                 det.detect_failed_tool_loop(),
                 det.detect_repeated_error_loop(),
             );

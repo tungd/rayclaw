@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -49,6 +50,13 @@ use crate::web::WebAdapter;
 /// When a second request arrives for a chat_id that is already processing,
 /// it waits for the first to finish before starting.
 pub type ChatLocks = Mutex<HashMap<i64, Arc<Mutex<()>>>>;
+pub type ChatRuns = Mutex<HashMap<i64, ChatRunHandle>>;
+
+#[derive(Debug, Clone)]
+pub struct ChatRunHandle {
+    pub run_id: u64,
+    pub abort_handle: tokio::task::AbortHandle,
+}
 
 pub struct AppState {
     pub config: Config,
@@ -62,6 +70,9 @@ pub struct AppState {
     pub acp_manager: Arc<crate::acp::AcpManager>,
     /// Per-chat concurrency lock: ensures only one agent loop runs per chat_id at a time.
     pub chat_locks: ChatLocks,
+    /// Latest background run per chat_id. Channels can replace this to supersede stale work.
+    pub chat_runs: ChatRuns,
+    pub next_chat_run_id: AtomicU64,
 }
 
 /// Build an `AppState` without starting any channels, schedulers, or signal handlers.
@@ -169,6 +180,8 @@ pub async fn create_app_state(
         tools,
         acp_manager,
         chat_locks: Mutex::new(HashMap::new()),
+        chat_runs: Mutex::new(HashMap::new()),
+        next_chat_run_id: AtomicU64::new(1),
     }))
 }
 

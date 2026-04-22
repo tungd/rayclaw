@@ -39,6 +39,7 @@ pub fn agent_browser_program() -> String {
 pub fn build_command(spec: &CommandSpec, working_dir: Option<&Path>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args);
+    cmd.kill_on_drop(true);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }

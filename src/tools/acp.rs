@@ -1,6 +1,6 @@
 use std::future::Future;
-use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -191,11 +191,7 @@ impl AcpCodingTool {
             .unwrap_or_else(|| "claude".to_string())
     }
 
-    async fn resolve_workspace(
-        &self,
-        input: &serde_json::Value,
-        message: &str,
-    ) -> Option<String> {
+    async fn resolve_workspace(&self, input: &serde_json::Value, message: &str) -> Option<String> {
         if let Some(workspace) = input.get("workspace").and_then(|v| v.as_str()) {
             let workspace = workspace.trim();
             if !workspace.is_empty() {
@@ -302,8 +298,7 @@ fn project_root_for_path(candidate: &Path) -> Option<PathBuf> {
             4
         } else if ancestor.join("pnpm-workspace.yaml").exists() {
             3
-        } else if ancestor.join("Cargo.toml").exists() || ancestor.join("pyproject.toml").exists()
-        {
+        } else if ancestor.join("Cargo.toml").exists() || ancestor.join("pyproject.toml").exists() {
             2
         } else if ancestor.join("package.json").exists() {
             1
@@ -352,7 +347,8 @@ fn workspace_matches(requested: Option<&str>, actual: &str) -> bool {
     let Some(requested) = requested else {
         return true;
     };
-    let requested = normalize_workspace_candidate(requested).unwrap_or_else(|| requested.to_string());
+    let requested =
+        normalize_workspace_candidate(requested).unwrap_or_else(|| requested.to_string());
     let actual = normalize_workspace_candidate(actual).unwrap_or_else(|| actual.to_string());
     requested == actual
 }
@@ -367,7 +363,7 @@ impl Tool for AcpCodingTool {
         ToolDefinition {
             name: "acp_coding".into(),
             description: "Delegate a coding task to an external AI coding agent (for example Codex or Claude Code). \
-                Prefer this for repository/project coding work instead of long direct bash/read_file exploration loops. \
+                Use this selectively for long-running or clearly delegation-friendly repository work, not as the default for every local coding/debugging task. \
                 Automatically manages sessions: reuses existing session for the chat or creates a new one. \
                 If agent is omitted, it resolves the best agent from chat memory/context. \
                 Sends immediate notification to the user, then executes the task. \
@@ -428,10 +424,7 @@ impl Tool for AcpCodingTool {
                 let sessions = self.manager.list_sessions().await;
                 if let Some(summary) = sessions.iter().find(|s| s.session_id == existing) {
                     if summary.agent_id == agent
-                        && workspace_matches(
-                            resolved_workspace.as_deref(),
-                            &summary.workspace,
-                        )
+                        && workspace_matches(resolved_workspace.as_deref(), &summary.workspace)
                     {
                         Some(existing)
                     } else {

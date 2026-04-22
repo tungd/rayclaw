@@ -2301,6 +2301,8 @@ mod tests {
             tools: ToolRegistry::new(&cfg, channel_registry, db),
             acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config_file("")),
             chat_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            chat_runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            next_chat_run_id: std::sync::atomic::AtomicU64::new(1),
         };
         Arc::new(state)
     }

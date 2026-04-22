@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -44,29 +45,22 @@ struct TelegramTarget {
 }
 
 fn telegram_conversation_thread_id(
-    is_topic_message: bool,
+    is_forum_supergroup: bool,
     thread_id: Option<ThreadId>,
 ) -> Option<ThreadId> {
-    if is_topic_message {
-        thread_id
-    } else {
-        None
+    match (is_forum_supergroup, thread_id) {
+        (true, Some(thread_id)) if thread_id == TELEGRAM_GENERAL_FORUM_THREAD_ID => None,
+        (_, thread_id) => thread_id,
     }
 }
 
 fn telegram_delivery_thread_id(
     is_forum_supergroup: bool,
-    is_topic_message: bool,
     thread_id: Option<ThreadId>,
 ) -> Option<ThreadId> {
-    if is_forum_supergroup {
-        if is_topic_message {
-            thread_id
-        } else {
-            Some(TELEGRAM_GENERAL_FORUM_THREAD_ID)
-        }
-    } else {
-        thread_id
+    match (is_forum_supergroup, thread_id) {
+        (true, Some(thread_id)) if thread_id == TELEGRAM_GENERAL_FORUM_THREAD_ID => None,
+        (_, thread_id) => thread_id,
     }
 }
 
@@ -78,10 +72,10 @@ struct TelegramDispatchKey {
 
 fn telegram_dispatch_key(
     chat_id: i64,
-    is_topic_message: bool,
+    is_forum_supergroup: bool,
     thread_id: Option<ThreadId>,
 ) -> TelegramDispatchKey {
-    let conversation_thread_id = telegram_conversation_thread_id(is_topic_message, thread_id)
+    let conversation_thread_id = telegram_conversation_thread_id(is_forum_supergroup, thread_id)
         .map(|ThreadId(MessageId(thread_id))| thread_id);
     TelegramDispatchKey {
         chat_id,
@@ -99,10 +93,19 @@ fn telegram_update_dispatch_key(update: &Update) -> Option<TelegramDispatchKey> 
         | UpdateKind::EditedBusinessMessage(message) => message,
         _ => return None,
     };
+    let is_forum_supergroup = matches!(
+        &message.chat.kind,
+        teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
+            kind: teloxide::types::PublicChatKind::Supergroup(
+                teloxide::types::PublicChatSupergroup { is_forum: true, .. }
+            ),
+            ..
+        })
+    );
 
     Some(telegram_dispatch_key(
         message.chat.id.0,
-        message.is_topic_message,
+        is_forum_supergroup,
         message.thread_id,
     ))
 }
@@ -312,6 +315,197 @@ pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Resul
 
     Ok(())
 }
+
+struct AbortTaskOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn clear_current_chat_run(state: &AppState, chat_id: i64, run_id: u64) {
+    let mut runs = state.chat_runs.lock().await;
+    if runs.get(&chat_id).map(|entry| entry.run_id) == Some(run_id) {
+        runs.remove(&chat_id);
+    }
+}
+
+async fn spawn_telegram_agent_run(
+    bot: Bot,
+    state: Arc<AppState>,
+    chat_id: i64,
+    runtime_chat_type: &'static str,
+    reply_target: TelegramTarget,
+    typing_target: TelegramTarget,
+    image_data: Option<(String, String)>,
+) {
+    let run_id = state.next_chat_run_id.fetch_add(1, Ordering::SeqCst);
+    let task_bot = bot.clone();
+    let task_state = state.clone();
+    let task = tokio::spawn(async move {
+        run_telegram_agent(
+            task_bot,
+            task_state,
+            run_id,
+            chat_id,
+            runtime_chat_type,
+            reply_target,
+            typing_target,
+            image_data,
+        )
+        .await;
+    });
+    let handle = crate::runtime::ChatRunHandle {
+        run_id,
+        abort_handle: task.abort_handle(),
+    };
+    let previous = {
+        let mut runs = state.chat_runs.lock().await;
+        runs.insert(chat_id, handle)
+    };
+    if let Some(previous) = previous {
+        info!(
+            "Superseding in-flight Telegram chat run for chat_id={} (old_run_id={}, new_run_id={})",
+            chat_id, previous.run_id, run_id
+        );
+        previous.abort_handle.abort();
+    }
+}
+
+async fn run_telegram_agent(
+    bot: Bot,
+    state: Arc<AppState>,
+    run_id: u64,
+    chat_id: i64,
+    runtime_chat_type: &'static str,
+    reply_target: TelegramTarget,
+    typing_target: TelegramTarget,
+    image_data: Option<(String, String)>,
+) {
+    let typing_bot = bot.clone();
+    let mut typing_guard = AbortTaskOnDrop::new(tokio::spawn(async move {
+        loop {
+            let mut req = typing_bot.send_chat_action(typing_target.chat_id, ChatAction::Typing);
+            if let Some(thread_id) = typing_target.thread_id {
+                req = req.message_thread_id(thread_id);
+            }
+            debug!(
+                "Sending Telegram typing indicator for {} thread {:?}",
+                typing_target.chat_id.0, typing_target.thread_id
+            );
+            if let Err(err) = req.await {
+                warn!(
+                    "Telegram typing indicator failed for {} thread {:?}: {err}",
+                    typing_target.chat_id.0, typing_target.thread_id
+                );
+            } else {
+                debug!(
+                    "Telegram typing indicator sent for {} thread {:?}",
+                    typing_target.chat_id.0, typing_target.thread_id
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+    }));
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let result = process_with_agent_with_events(
+        &state,
+        AgentRequestContext {
+            caller_channel: "telegram",
+            chat_id,
+            chat_type: runtime_chat_type,
+        },
+        None,
+        image_data,
+        Some(&event_tx),
+    )
+    .await;
+    typing_guard.abort();
+
+    match result {
+        Ok(response) => {
+            drop(event_tx);
+            let mut used_send_message_tool = false;
+            let mut external_delivery = false;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    AgentEvent::ToolStart { name } => {
+                        if name == "send_message" {
+                            used_send_message_tool = true;
+                        }
+                    }
+                    AgentEvent::ExternalDelivery => external_delivery = true,
+                    _ => {}
+                }
+            }
+
+            if !response.is_empty() {
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    &response,
+                )
+                .await;
+
+                let bot_msg = StoredMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    chat_id,
+                    sender_name: state.config.bot_username.clone(),
+                    content: response,
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
+            } else if used_send_message_tool || external_delivery {
+                info!(
+                    "Agent returned empty final response for chat {}; content was already delivered directly",
+                    chat_id
+                );
+            } else {
+                let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    &fallback,
+                )
+                .await;
+                let bot_msg = StoredMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    chat_id,
+                    sender_name: state.config.bot_username.clone(),
+                    content: fallback,
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
+            }
+        }
+        Err(e) => {
+            error!("Error processing message: {}", e);
+            let reply = format!("Error: {e}");
+            send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
+        }
+    }
+
+    clear_current_chat_run(&state, chat_id, run_id).await;
+}
+
 async fn handle_message(
     bot: Bot,
     msg: teloxide::types::Message,
@@ -328,22 +522,14 @@ async fn handle_message(
         })
     );
     let conversation_thread_id =
-        telegram_conversation_thread_id(msg.is_topic_message, msg.thread_id);
+        telegram_conversation_thread_id(is_forum_supergroup, msg.thread_id);
     let reply_target = TelegramTarget {
         chat_id: msg.chat.id,
-        thread_id: telegram_delivery_thread_id(
-            is_forum_supergroup,
-            msg.is_topic_message,
-            msg.thread_id,
-        ),
+        thread_id: telegram_delivery_thread_id(is_forum_supergroup, msg.thread_id),
     };
     let typing_target = TelegramTarget {
         chat_id: msg.chat.id,
-        thread_id: telegram_delivery_thread_id(
-            is_forum_supergroup,
-            msg.is_topic_message,
-            msg.thread_id,
-        ),
+        thread_id: telegram_delivery_thread_id(is_forum_supergroup, msg.thread_id),
     };
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
@@ -393,6 +579,16 @@ async fn handle_message(
         })
         .await
         .unwrap_or(raw_chat_id);
+        if let Some(handle) = {
+            let runs = state.chat_runs.lock().await;
+            runs.get(&chat_id).cloned()
+        } {
+            info!(
+                "Cancelling in-flight Telegram chat run for /reset on chat_id={} (run_id={})",
+                chat_id, handle.run_id
+            );
+            handle.abort_handle.abort();
+        }
         let _ = call_blocking(state.db.clone(), move |db| db.clear_chat_context(chat_id)).await;
         send_response(
             &bot,
@@ -772,119 +968,16 @@ async fn handle_message(
         chat_id,
         text.chars().take(100).collect::<String>()
     );
-
-    // Start continuous typing indicator
-    let typing_bot = bot.clone();
-    let typing_handle = tokio::spawn(async move {
-        loop {
-            let mut req = typing_bot.send_chat_action(typing_target.chat_id, ChatAction::Typing);
-            if let Some(thread_id) = typing_target.thread_id {
-                req = req.message_thread_id(thread_id);
-            }
-            debug!(
-                "Sending Telegram typing indicator for {} thread {:?}",
-                typing_target.chat_id.0, typing_target.thread_id
-            );
-            if let Err(err) = req.await {
-                warn!(
-                    "Telegram typing indicator failed for {} thread {:?}: {err}",
-                    typing_target.chat_id.0, typing_target.thread_id
-                );
-            } else {
-                debug!(
-                    "Telegram typing indicator sent for {} thread {:?}",
-                    typing_target.chat_id.0, typing_target.thread_id
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        }
-    });
-
-    // Process through platform-agnostic agent engine.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    match process_with_agent_with_events(
-        &state,
-        AgentRequestContext {
-            caller_channel: "telegram",
-            chat_id,
-            chat_type: runtime_chat_type,
-        },
-        None,
+    spawn_telegram_agent_run(
+        bot,
+        state,
+        chat_id,
+        runtime_chat_type,
+        reply_target,
+        typing_target,
         image_data,
-        Some(&event_tx),
     )
-    .await
-    {
-        Ok(response) => {
-            typing_handle.abort();
-            drop(event_tx);
-            let mut used_send_message_tool = false;
-            let mut external_delivery = false;
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    AgentEvent::ToolStart { name } => {
-                        if name == "send_message" {
-                            used_send_message_tool = true;
-                        }
-                    }
-                    AgentEvent::ExternalDelivery => external_delivery = true,
-                    _ => {}
-                }
-            }
-
-            if !response.is_empty() {
-                send_response(
-                    &bot,
-                    reply_target.chat_id,
-                    reply_target.thread_id,
-                    &response,
-                )
-                .await;
-
-                // Store bot response
-                let bot_msg = StoredMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    chat_id,
-                    sender_name: state.config.bot_username.clone(),
-                    content: response,
-                    is_from_bot: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
-            }
-            // If response is empty, agent likely delivered via send_message tool directly.
-            else if used_send_message_tool || external_delivery {
-                info!(
-                    "Agent returned empty final response for chat {}; content was already delivered directly",
-                    chat_id
-                );
-            } else {
-                let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
-                send_response(
-                    &bot,
-                    reply_target.chat_id,
-                    reply_target.thread_id,
-                    &fallback,
-                )
-                .await;
-                let bot_msg = StoredMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    chat_id,
-                    sender_name: state.config.bot_username.clone(),
-                    content: fallback,
-                    is_from_bot: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
-            }
-        }
-        Err(e) => {
-            typing_handle.abort();
-            error!("Error processing message: {}", e);
-            let reply = format!("Error: {e}");
-            send_response(&bot, reply_target.chat_id, reply_target.thread_id, &reply).await;
-        }
-    }
+    .await;
 
     Ok(())
 }
@@ -1090,7 +1183,9 @@ async fn send_telegram_markdown_or_plain(
         if let Some(thread_id) = thread_id {
             fallback_req = fallback_req.message_thread_id(thread_id);
         }
-        let _ = fallback_req.await;
+        if let Err(fallback_err) = fallback_req.await {
+            warn!("Telegram plain text fallback send failed: {fallback_err}");
+        }
     }
 }
 
@@ -1699,28 +1794,37 @@ mod tests {
     fn test_telegram_conversation_thread_id_ignores_general_topic_thread_for_chat_identity() {
         let general_thread_id = Some(ThreadId(MessageId(1)));
         assert_eq!(
-            telegram_conversation_thread_id(false, general_thread_id),
+            telegram_conversation_thread_id(true, general_thread_id),
             None
         );
     }
 
     #[test]
-    fn test_telegram_delivery_thread_id_targets_general_forum_topic() {
-        assert_eq!(
-            telegram_delivery_thread_id(true, false, None),
-            Some(ThreadId(MessageId(1)))
-        );
+    fn test_telegram_delivery_thread_id_omits_general_forum_topic() {
+        assert_eq!(telegram_delivery_thread_id(true, None), None);
     }
 
     #[test]
     fn test_telegram_delivery_thread_id_keeps_regular_forum_topic() {
         let thread_id = Some(ThreadId(MessageId(42)));
-        assert_eq!(telegram_delivery_thread_id(true, true, thread_id), thread_id);
+        assert_eq!(telegram_delivery_thread_id(true, thread_id), thread_id);
     }
 
     #[test]
     fn test_telegram_delivery_thread_id_keeps_non_forum_chat_unthreaded() {
-        assert_eq!(telegram_delivery_thread_id(false, false, None), None);
+        assert_eq!(telegram_delivery_thread_id(false, None), None);
+    }
+
+    #[test]
+    fn test_telegram_delivery_thread_id_preserves_regular_topic_without_topic_flag() {
+        let thread_id = Some(ThreadId(MessageId(42)));
+        assert_eq!(telegram_delivery_thread_id(true, thread_id), thread_id);
+    }
+
+    #[test]
+    fn test_telegram_delivery_thread_id_omits_general_thread_id_marker() {
+        let general_thread_id = Some(ThreadId(MessageId(1)));
+        assert_eq!(telegram_delivery_thread_id(true, general_thread_id), None);
     }
 
     #[test]
@@ -1734,8 +1838,8 @@ mod tests {
     #[test]
     fn test_telegram_dispatch_key_treats_general_topic_as_parent_chat() {
         let general_topic =
-            telegram_dispatch_key(-1001234567890, false, Some(ThreadId(MessageId(1))));
-        let parent_chat = telegram_dispatch_key(-1001234567890, false, None);
+            telegram_dispatch_key(-1001234567890, true, Some(ThreadId(MessageId(1))));
+        let parent_chat = telegram_dispatch_key(-1001234567890, true, None);
 
         assert_eq!(general_topic, parent_chat);
     }
