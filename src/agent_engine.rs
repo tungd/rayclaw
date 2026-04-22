@@ -1655,7 +1655,7 @@ You are called {bot_username}. You are connected via {caller_channel}."#
 You have the following tool categories at your disposal:
 - **Shell**: execute bash commands (bash)
 - **Files**: read_file, write_file, edit_file, glob (pattern search), grep (content search)
-- **Memory**: read_memory / write_memory (file-based), structured_read_memory / structured_write_memory (SQLite-backed)
+- **Memory**: read_memory / write_memory (file-based), structured_memory_search / structured_memory_update / structured_memory_delete (SQLite-backed)
 - **Web**: web_search (DuckDuckGo), web_fetch (fetch and parse URLs)
 - **Browser automation**: agent_browser — local rendered webpage/UI automation via the agent-browser CLI
 - **Messaging**: send_message — push intermediate updates or files mid-conversation
@@ -1705,6 +1705,8 @@ Browser automation guidance:
 - Default to `chat` scope for remembered information.
 - Use `global` scope only for preferences or facts that should apply across all conversations.
 - If a global memory write is rejected by permissions, immediately retry with `chat` scope and continue without surfacing the failed attempt if the retry succeeds.
+- Prefer `write_memory` or an explicit memory command such as `remember ...` or `take note that ...` for saving new facts.
+- Use `structured_memory_update` only when correcting an existing structured memory and only after `structured_memory_search` returns the target `id`. Never invent memory ids.
 
 ## Scheduling
 - Cron expressions use 6 fields: `sec min hour dom month dow` (e.g., `0 */5 * * * *`).
@@ -3098,6 +3100,13 @@ mod tests {
         assert!(prompt.contains("an agentic AI assistant operating across chat channels"));
         assert!(prompt.contains("acp_coding"));
         assert!(prompt.contains("agent_browser"));
+        assert!(prompt.contains(
+            "structured_memory_search / structured_memory_update / structured_memory_delete"
+        ));
+        assert!(prompt.contains(
+            "Use `structured_memory_update` only when correcting an existing structured memory"
+        ));
+        assert!(!prompt.contains("structured_read_memory / structured_write_memory"));
         assert!(prompt.contains("not a provider-native browsing capability"));
         assert!(prompt
             .contains("Use `acp_coding` only when an external coding agent is clearly beneficial"));

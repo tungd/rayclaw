@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::llm_types::ToolDefinition;
@@ -17,12 +18,39 @@ impl SyncSkillsTool {
         }
     }
 
-    async fn fetch_skill_content(
-        source_repo: &str,
-        skill_name: &str,
-        git_ref: &str,
-    ) -> Result<String, String> {
-        let candidates = [
+    fn normalize_skill_locator(skill_name: &str) -> String {
+        let trimmed = skill_name.trim().trim_matches('/');
+        let without_prefix = trimmed.strip_prefix("skills/").unwrap_or(trimmed);
+        let without_skill_md = without_prefix
+            .strip_suffix("/SKILL.md")
+            .or_else(|| without_prefix.strip_suffix("/skill.md"))
+            .unwrap_or(without_prefix);
+        without_skill_md
+            .strip_suffix(".md")
+            .unwrap_or(without_skill_md)
+            .to_string()
+    }
+
+    fn default_target_name(skill_name: &str) -> String {
+        Self::normalize_skill_locator(skill_name)
+            .rsplit('/')
+            .next()
+            .unwrap_or(skill_name.trim())
+            .to_string()
+    }
+
+    fn candidate_refs(git_ref: &str) -> Vec<String> {
+        let mut refs = vec![git_ref.to_string()];
+        match git_ref {
+            "main" => refs.push("master".to_string()),
+            "master" => refs.push("main".to_string()),
+            _ => {}
+        }
+        refs
+    }
+
+    fn candidate_urls(source_repo: &str, git_ref: &str, skill_name: &str) -> Vec<String> {
+        vec![
             format!(
                 "https://raw.githubusercontent.com/{}/{}/skills/{}/SKILL.md",
                 source_repo, git_ref, skill_name
@@ -35,7 +63,19 @@ impl SyncSkillsTool {
                 "https://raw.githubusercontent.com/{}/{}/{}.md",
                 source_repo, git_ref, skill_name
             ),
-        ];
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/SKILL.md",
+                source_repo, git_ref
+            ),
+        ]
+    }
+
+    async fn fetch_skill_content(
+        source_repo: &str,
+        skill_name: &str,
+        git_ref: &str,
+    ) -> Result<(String, String), String> {
+        let normalized_skill = Self::normalize_skill_locator(skill_name);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -43,21 +83,23 @@ impl SyncSkillsTool {
             .map_err(|e| e.to_string())?;
 
         let mut errors = Vec::new();
-        for url in candidates {
-            match client
-                .get(&url)
-                .header("User-Agent", "RayClaw/1.0")
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let text = resp.text().await.map_err(|e| e.to_string())?;
-                    if !text.trim().is_empty() {
-                        return Ok(text);
+        for candidate_ref in Self::candidate_refs(git_ref) {
+            for url in Self::candidate_urls(source_repo, &candidate_ref, &normalized_skill) {
+                match client
+                    .get(&url)
+                    .header("User-Agent", "RayClaw/1.0")
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        let text = resp.text().await.map_err(|e| e.to_string())?;
+                        if !text.trim().is_empty() {
+                            return Ok((text, candidate_ref));
+                        }
                     }
+                    Ok(resp) => errors.push(format!("{} -> HTTP {}", url, resp.status())),
+                    Err(e) => errors.push(format!("{} -> {}", url, e)),
                 }
-                Ok(resp) => errors.push(format!("{} -> HTTP {}", url, resp.status())),
-                Err(e) => errors.push(format!("{} -> {}", url, e)),
             }
         }
 
@@ -103,10 +145,13 @@ impl SyncSkillsTool {
         if yaml_block.trim().is_empty() {
             (None, body)
         } else {
-            (
-                serde_yaml::from_str::<serde_yaml::Value>(&yaml_block).ok(),
-                body,
-            )
+            let parsed = serde_yaml::from_str::<serde_yaml::Value>(&yaml_block)
+                .ok()
+                .or_else(|| {
+                    let normalized = crate::skills::normalize_wrapped_frontmatter(&yaml_block);
+                    serde_yaml::from_str::<serde_yaml::Value>(&normalized).ok()
+                });
+            (parsed, body)
         }
     }
 
@@ -128,6 +173,20 @@ impl SyncSkillsTool {
         skill_name: &str,
         target_name: &str,
     ) -> String {
+        #[derive(Serialize)]
+        struct NormalizedFrontmatter {
+            name: String,
+            description: String,
+            source: String,
+            version: String,
+            updated_at: String,
+            license: String,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            platforms: Vec<String>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            deps: Vec<String>,
+        }
+
         let (fm, body) = Self::split_frontmatter(raw);
         let fm = fm.unwrap_or(serde_yaml::Value::Null);
 
@@ -149,41 +208,29 @@ impl SyncSkillsTool {
             deps = Self::str_seq(fm.get("compatibility").and_then(|c| c.get("deps")));
         }
 
-        let mut frontmatter = vec![
-            "---".to_string(),
-            format!("name: {}", target_name),
-            format!("description: {}", description),
-            format!("source: remote:{}", source_repo),
-            format!("version: {}", git_ref),
-            format!("updated_at: {}", Utc::now().to_rfc3339()),
-            "license: Proprietary. LICENSE.txt has complete terms".to_string(),
-        ];
+        let frontmatter = NormalizedFrontmatter {
+            name: target_name.to_string(),
+            description,
+            source: format!("remote:{}", source_repo),
+            version: git_ref.to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+            license: "Proprietary. LICENSE.txt has complete terms".to_string(),
+            platforms,
+            deps,
+        };
+        let yaml = serde_yaml::to_string(&frontmatter).unwrap_or_default();
+        let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml).trim_end();
 
-        if !platforms.is_empty() {
-            frontmatter.push("platforms:".to_string());
-            for p in platforms {
-                frontmatter.push(format!("  - {}", p));
-            }
-        }
-        if !deps.is_empty() {
-            frontmatter.push("deps:".to_string());
-            for d in deps {
-                frontmatter.push(format!("  - {}", d));
-            }
-        }
-
-        frontmatter.push("---".to_string());
-        frontmatter.push(String::new());
-        if body.is_empty() {
-            frontmatter.push(format!(
+        let rendered_body = if body.is_empty() {
+            format!(
                 "# {}\n\nSynced from `{}` (`{}`).",
                 target_name, source_repo, git_ref
-            ));
+            )
         } else {
-            frontmatter.push(body);
-        }
+            body
+        };
 
-        frontmatter.join("\n")
+        format!("---\n{}\n---\n\n{}", yaml, rendered_body)
     }
 }
 
@@ -245,18 +292,24 @@ impl Tool for SyncSkillsTool {
             .get("target_name")
             .and_then(|v| v.as_str())
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or(skill_name)
-            .trim();
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| Self::default_target_name(skill_name));
 
-        let raw = match Self::fetch_skill_content(source_repo, skill_name, git_ref).await {
-            Ok(v) => v,
-            Err(e) => return ToolResult::error(e).with_error_type("sync_fetch_failed"),
-        };
+        let (raw, resolved_ref) =
+            match Self::fetch_skill_content(source_repo, skill_name, git_ref).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(e).with_error_type("sync_fetch_failed"),
+            };
 
-        let normalized =
-            Self::normalize_skill_markdown(&raw, source_repo, git_ref, skill_name, target_name);
+        let normalized = Self::normalize_skill_markdown(
+            &raw,
+            source_repo,
+            &resolved_ref,
+            skill_name,
+            &target_name,
+        );
 
-        let out_dir = self.skills_dir.join(target_name);
+        let out_dir = self.skills_dir.join(&target_name);
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
             return ToolResult::error(format!("Failed to create skill directory: {e}"))
                 .with_error_type("sync_write_failed");
@@ -273,7 +326,7 @@ impl Tool for SyncSkillsTool {
             skill_name,
             target_name,
             source_repo,
-            git_ref,
+            resolved_ref,
             out_file.display()
         ))
     }
@@ -314,5 +367,50 @@ mod tests {
         assert!(out.contains("source: remote:vercel-labs/skills"));
         assert!(out.contains("version: main"));
         assert!(out.contains("updated_at:"));
+    }
+
+    #[test]
+    fn test_normalize_skill_markdown_quotes_multiline_description() {
+        let raw = r#"---
+name: demo
+description: One line,
+continued line
+---
+Body
+"#;
+        let out = SyncSkillsTool::normalize_skill_markdown(
+            raw,
+            "basecamp/fizzy-cli",
+            "master",
+            "demo",
+            "demo",
+        );
+        assert!(out.contains("description:"));
+        assert!(out.contains("continued line"));
+        let (fm, body) = SyncSkillsTool::split_frontmatter(&out);
+        assert!(fm.is_some(), "normalized frontmatter should stay parseable");
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn test_default_target_name_normalizes_skill_locator() {
+        assert_eq!(SyncSkillsTool::default_target_name("skills/fizzy"), "fizzy");
+        assert_eq!(
+            SyncSkillsTool::default_target_name("fizzy/SKILL.md"),
+            "fizzy"
+        );
+        assert_eq!(SyncSkillsTool::default_target_name("fizzy.md"), "fizzy");
+    }
+
+    #[test]
+    fn test_candidate_refs_try_main_and_master() {
+        assert_eq!(
+            SyncSkillsTool::candidate_refs("main"),
+            vec!["main".to_string(), "master".to_string()]
+        );
+        assert_eq!(
+            SyncSkillsTool::candidate_refs("master"),
+            vec!["master".to_string(), "main".to_string()]
+        );
     }
 }

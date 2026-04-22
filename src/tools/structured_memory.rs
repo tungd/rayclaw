@@ -198,7 +198,7 @@ impl Tool for StructuredMemoryUpdateTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "structured_memory_update".into(),
-            description: "Update the content or category of an existing structured memory. Use this to correct outdated or wrong memories instead of creating a duplicate.".into(),
+            description: "Update the content or category of an existing structured memory. Use structured_memory_search first to find the exact memory id, and do not guess or invent ids. Use this only to correct an existing memory instead of creating a duplicate.".into(),
             input_schema: schema_object(
                 json!({
                     "id": {

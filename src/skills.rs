@@ -124,9 +124,19 @@ impl SkillManager {
     /// Load a skill with availability diagnostics.
     pub fn load_skill_checked(&self, name: &str) -> Result<(SkillMetadata, String), String> {
         let all_skills = self.discover_skills_internal(true);
+        let requested = name.trim();
 
         for skill in all_skills {
-            if skill.name != name {
+            let dir_name = skill
+                .dir_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if skill.name != requested
+                && !skill.name.eq_ignore_ascii_case(requested)
+                && dir_name != requested
+                && !dir_name.eq_ignore_ascii_case(requested)
+            {
                 continue;
             }
 
@@ -325,6 +335,66 @@ fn missing_deps(deps: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn is_top_level_frontmatter_key(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('#') {
+        return false;
+    }
+    if trimmed.len() != line.len() {
+        return false;
+    }
+    let Some((key, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
+}
+
+pub(crate) fn normalize_wrapped_frontmatter(yaml_block: &str) -> String {
+    let mut normalized: Vec<String> = Vec::new();
+    let mut last_scalar_idx: Option<usize> = None;
+
+    for line in yaml_block.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            normalized.push(line.to_string());
+            last_scalar_idx = None;
+            continue;
+        }
+
+        if is_top_level_frontmatter_key(line) {
+            let is_inline_scalar = line
+                .split_once(':')
+                .map(|(_, rest)| !rest.trim().is_empty())
+                .unwrap_or(false);
+            normalized.push(line.to_string());
+            last_scalar_idx = is_inline_scalar.then_some(normalized.len() - 1);
+            continue;
+        }
+
+        if (line.starts_with(' ') || line.starts_with('\t') || trimmed.starts_with('-'))
+            && !trimmed.starts_with("---")
+            && !trimmed.starts_with("...")
+        {
+            normalized.push(line.to_string());
+            last_scalar_idx = None;
+            continue;
+        }
+
+        if let Some(idx) = last_scalar_idx {
+            normalized[idx].push(' ');
+            normalized[idx].push_str(trimmed);
+        } else {
+            normalized.push(line.to_string());
+        }
+    }
+
+    normalized.join("\n")
+}
+
 /// Attempt to convert single-line frontmatter (`--- name: x description: y --- body`)
 /// into standard multi-line YAML format for parsing.
 fn normalize_single_line_frontmatter(content: &str) -> Option<String> {
@@ -391,7 +461,13 @@ fn parse_skill_md(content: &str, dir_path: &std::path::Path) -> Option<(SkillMet
         return None;
     }
 
-    let fm: SkillFrontmatter = serde_yaml::from_str(&yaml_block).ok()?;
+    let fm: SkillFrontmatter = match serde_yaml::from_str(&yaml_block) {
+        Ok(fm) => fm,
+        Err(_) => {
+            let normalized_yaml = normalize_wrapped_frontmatter(&yaml_block);
+            serde_yaml::from_str(&normalized_yaml).ok()?
+        }
+    };
     let name = fm.name?.trim().to_string();
     if name.is_empty() {
         return None;
@@ -519,6 +595,47 @@ Instructions.
         assert_eq!(meta.name, "frontend-design");
         assert!(meta.description.starts_with("Create distinctive"));
         assert!(body.contains("This skill guides"));
+    }
+
+    #[test]
+    fn test_parse_skill_md_wrapped_description_frontmatter() {
+        let content = r#"---
+name: fizzy
+description: Interact with Fizzy via the Fizzy CLI. Manage boards, cards, columns, comments,
+steps, reactions, tags, users, notifications, pins, webhooks, and account settings.
+source: remote:basecamp/fizzy-cli
+---
+Instructions.
+"#;
+        let dir = PathBuf::from("/tmp/skills/fizzy");
+        let result = parse_skill_md(content, &dir);
+        assert!(result.is_some(), "wrapped frontmatter should parse");
+        let (meta, body) = result.unwrap();
+        assert_eq!(meta.name, "fizzy");
+        assert!(meta.description.contains("Manage boards, cards"));
+        assert!(meta.description.contains("steps, reactions, tags"));
+        assert_eq!(meta.source, "remote:basecamp/fizzy-cli");
+        assert_eq!(body, "Instructions.");
+    }
+
+    #[test]
+    fn test_load_skill_checked_matches_directory_name_case_insensitively() {
+        let dir =
+            std::env::temp_dir().join(format!("rayclaw_skills_case_test_{}", uuid::Uuid::new_v4()));
+        let skill_dir = dir.join("fizzy");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Fizzy\ndescription: Skill\n---\nBody\n",
+        )
+        .unwrap();
+
+        let manager = SkillManager::from_skills_dir(dir.to_str().unwrap());
+        let loaded = manager.load_skill_checked("fizzy").unwrap();
+        assert_eq!(loaded.0.name, "Fizzy");
+        assert_eq!(loaded.1, "Body");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -64,6 +64,14 @@ pub fn extract_explicit_memory_command(text: &str) -> Option<String> {
         "remember that ",
         "remember:",
         "remember ",
+        "please take note that ",
+        "take note that ",
+        "please note that ",
+        "note that ",
+        "make a note that ",
+        "keep in mind that ",
+        "save this for later:",
+        "save this for later ",
         "memo:",
     ];
     for p in prefixes {
@@ -119,6 +127,14 @@ mod tests {
         assert_eq!(
             extract_explicit_memory_command("Remember that prod db is on 5433"),
             Some("prod db is on 5433".to_string())
+        );
+        assert_eq!(
+            extract_explicit_memory_command(
+                "Please take note that CareAI school project uses GitHub account tungd, not revenge-td"
+            ),
+            Some(
+                "CareAI school project uses GitHub account tungd, not revenge-td".to_string()
+            )
         );
         assert_eq!(
             extract_explicit_memory_command("记住：下周三发布"),
