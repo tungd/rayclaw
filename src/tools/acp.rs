@@ -70,11 +70,12 @@ async fn prompt_with_progress_updates(
     timeout_secs: Option<u64>,
     chat_id: Option<i64>,
     progress_callback: Option<JobCompletionCallback>,
+    agent_name: &str,
 ) -> Result<(AcpPromptResult, AcpProgressSummary), String> {
     let (progress_tx, progress_handle) = match (chat_id, progress_callback) {
         (Some(cid), Some(cb)) => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::acp::AcpProgressEvent>();
-            let handle = crate::acp::spawn_progress_forwarder(rx, cid, cb);
+            let handle = crate::acp::spawn_progress_forwarder(rx, cid, cb, agent_name);
             (Some(tx), Some(handle))
         }
         _ => (None, None),
@@ -528,6 +529,7 @@ impl Tool for AcpCodingTool {
                 timeout_secs,
                 chat_id,
                 progress_callback_from_notify(self.notify.as_ref()),
+                &agent,
             )
             .await
             {
@@ -713,6 +715,16 @@ impl Tool for AcpPromptTool {
         let timeout_secs = input.get("timeout_secs").and_then(|v| v.as_u64());
         let chat_id = auth_context_from_input(&input).map(|ctx| ctx.caller_chat_id);
 
+        // Resolve agent name from session for progress prefix
+        let agent_name = self
+            .manager
+            .list_sessions()
+            .await
+            .iter()
+            .find(|s| s.session_id == session_id)
+            .map(|s| s.agent_id.clone())
+            .unwrap_or_else(|| "agent".to_string());
+
         match prompt_with_progress_updates(
             &self.manager,
             session_id,
@@ -720,6 +732,7 @@ impl Tool for AcpPromptTool {
             timeout_secs,
             chat_id,
             progress_callback_from_notify(self.notify.as_ref()),
+            &agent_name,
         )
         .await
         {

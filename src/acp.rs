@@ -1557,7 +1557,9 @@ fn spawn_progress_forwarder_with_interval(
     chat_id: i64,
     callback: JobCompletionCallback,
     flush_interval: Duration,
+    agent_name: &str,
 ) -> tokio::task::JoinHandle<AcpProgressSummary> {
+    let agent_prefix = format!("*{agent_name}:* ");
     tokio::spawn(async move {
         let mut tool_ticker = tokio::time::interval(flush_interval);
         tool_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1572,12 +1574,15 @@ fn spawn_progress_forwarder_with_interval(
         let mut agent_timer = std::pin::Pin::from(Box::new(tokio::time::sleep_until(far_future)));
         let mut agent_flush_armed = false;
 
-        let flush_agent_buffer = |buffer: &mut String| -> Option<String> {
+        let flush_agent_buffer = |buffer: &mut String, prefix: &str| -> Option<String> {
             if buffer.trim().is_empty() {
                 buffer.clear();
                 None
             } else {
-                Some(std::mem::take(buffer))
+                let mut text = String::with_capacity(prefix.len() + buffer.len());
+                text.push_str(prefix);
+                text.push_str(&std::mem::take(buffer));
+                Some(text)
             }
         };
 
@@ -1590,7 +1595,7 @@ fn spawn_progress_forwarder_with_interval(
                     }
                 }
                 _ = &mut agent_timer, if agent_flush_armed => {
-                    if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                    if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                         summary.forwarded_agent_text = true;
                         callback(chat_id, text).await;
                     }
@@ -1607,7 +1612,7 @@ fn spawn_progress_forwarder_with_interval(
                         let started_at = agent_buffer_started_at.get_or_insert(now);
                         agent_buffer.push_str(&text);
                         if agent_buffer.len() >= 1200 {
-                            if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                            if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                                 summary.forwarded_agent_text = true;
                                 callback(chat_id, text).await;
                             }
@@ -1627,7 +1632,7 @@ fn spawn_progress_forwarder_with_interval(
                         }
                     }
                     Some(AcpProgressEvent::ToolStart { name }) => {
-                        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                        if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
                         }
@@ -1636,7 +1641,7 @@ fn spawn_progress_forwarder_with_interval(
                         tool_events.push(format!("started `{name}`"));
                     }
                     Some(AcpProgressEvent::ToolComplete { name, status }) => {
-                        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+                        if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
                         }
@@ -1656,7 +1661,7 @@ fn spawn_progress_forwarder_with_interval(
             }
         }
 
-        if let Some(text) = flush_agent_buffer(&mut agent_buffer) {
+        if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
             summary.forwarded_agent_text = true;
             callback(chat_id, text).await;
         }
@@ -1675,8 +1680,15 @@ pub fn spawn_progress_forwarder(
     rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
     callback: JobCompletionCallback,
+    agent_name: &str,
 ) -> tokio::task::JoinHandle<AcpProgressSummary> {
-    spawn_progress_forwarder_with_interval(rx, chat_id, callback, Duration::from_secs(30))
+    spawn_progress_forwarder_with_interval(
+        rx,
+        chat_id,
+        callback,
+        Duration::from_secs(30),
+        agent_name,
+    )
 }
 
 /// An active ACP agent session with its connection
@@ -2275,11 +2287,11 @@ impl AcpManager {
         let progress_callback = on_progress.clone();
 
         tokio::spawn(async move {
-            let _agent_id = agent_id_for_task;
+            let agent_id_for_task = agent_id_for_task;
             let (progress_tx, progress_handle) = match (chat_id, progress_callback) {
                 (Some(cid), Some(cb)) => {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
-                    let handle = spawn_progress_forwarder(rx, cid, cb);
+                    let handle = spawn_progress_forwarder(rx, cid, cb, &agent_id_for_task);
                     (Some(tx), Some(handle))
                 }
                 _ => (None, None),
@@ -3409,7 +3421,7 @@ mod tests {
         });
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
-        let handle = spawn_progress_forwarder(rx, 42, callback);
+        let handle = spawn_progress_forwarder(rx, 42, callback, "test-agent");
 
         tx.send(AcpProgressEvent::ToolStart {
             name: "bash".to_string(),

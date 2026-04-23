@@ -649,12 +649,24 @@ async fn maybe_handle_acp(
         if let Some(session_id) = state.acp_manager.chat_session(chat_id).await {
             // Set up progress streaming channel
             let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            // Resolve agent name from session for progress prefix
+            let agent_name = state
+                .acp_manager
+                .list_sessions()
+                .await
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .map(|s| s.agent_id.clone())
+                .unwrap_or_else(|| "agent".to_string());
+
             let progress_handle = spawn_acp_progress_consumer(
                 progress_rx,
                 state.channel_registry.clone(),
                 state.db.clone(),
                 state.config.bot_username.clone(),
                 chat_id,
+                &agent_name,
             );
 
             // Route to ACP agent
@@ -696,6 +708,7 @@ fn spawn_acp_progress_consumer(
     db: std::sync::Arc<crate::db::Database>,
     bot_username: String,
     chat_id: i64,
+    agent_name: &str,
 ) -> tokio::task::JoinHandle<crate::acp::AcpProgressSummary> {
     let callback: crate::acp::JobCompletionCallback = std::sync::Arc::new(move |chat_id, text| {
         let registry = registry.clone();
@@ -716,7 +729,7 @@ fn spawn_acp_progress_consumer(
         })
     });
 
-    crate::acp::spawn_progress_forwarder(rx, chat_id, callback)
+    crate::acp::spawn_progress_forwarder(rx, chat_id, callback, agent_name)
 }
 
 pub(crate) async fn process_with_agent_impl(
