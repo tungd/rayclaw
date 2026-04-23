@@ -28,6 +28,7 @@ fn hash_tool_call(name: &str, input: &serde_json::Value) -> u64 {
 }
 
 const COMPACTION_SUMMARIZATION_TIMEOUT_SECS: u64 = 15;
+const AGENT_TURN_TIMEOUT_SECS: u64 = 120;
 
 struct LoopDetector {
     /// Recent tool calls, newest at the tail.
@@ -740,6 +741,8 @@ pub(crate) async fn process_with_agent_impl(
     event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<String> {
     let chat_id = context.chat_id;
+    let agent_turn_started = std::time::Instant::now();
+    let mut last_tool_name: Option<String> = None;
 
     // Acquire per-chat lock to prevent concurrent agent loops for the same chat.
     // If another agent loop is already running for this chat_id, we wait for it to finish.
@@ -978,6 +981,36 @@ pub(crate) async fn process_with_agent_impl(
     let mut loop_detector = LoopDetector::new(state.config.max_loop_repeats);
     let mut overflow_recovery_attempted = false;
     for iteration in 0..state.config.max_tool_iterations {
+        if agent_turn_started.elapsed().as_secs() >= AGENT_TURN_TIMEOUT_SECS {
+            clear_todo(&state.config.data_dir, chat_id);
+            let elapsed_secs = agent_turn_started.elapsed().as_secs();
+            let timeout_msg = if let Some(tool_name) = last_tool_name.as_deref() {
+                format!(
+                    "I stopped after {elapsed_secs}s and {} tool iterations while still working through `{tool_name}`. Please ask me to continue or narrow the task.",
+                    iteration
+                )
+            } else {
+                format!(
+                    "I stopped after {elapsed_secs}s and {} tool iterations without reaching a final answer. Please ask me to continue or narrow the task.",
+                    iteration
+                )
+            };
+            messages.push(Message {
+                role: "assistant".into(),
+                content: MessageContent::Text(timeout_msg.clone()),
+            });
+            strip_images_for_session(&mut messages);
+            if let Ok(json) = serde_json::to_string(&messages) {
+                let _ = call_blocking(state.db.clone(), move |db| db.save_session(chat_id, &json))
+                    .await;
+            }
+            if let Some(tx) = event_tx {
+                let _ = tx.send(AgentEvent::FinalResponse {
+                    text: timeout_msg.clone(),
+                });
+            }
+            return Ok(timeout_msg);
+        }
         compact_messages_for_request_budget(
             state,
             context.caller_channel,
@@ -1207,6 +1240,7 @@ pub(crate) async fn process_with_agent_impl(
             let mut loop_detected_error_preview = None;
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
+                    last_tool_name = Some(name.clone());
                     if let Some(tx) = event_tx {
                         let _ = tx.send(AgentEvent::ToolStart { name: name.clone() });
                     }

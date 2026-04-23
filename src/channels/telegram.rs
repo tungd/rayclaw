@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -343,6 +344,18 @@ async fn clear_current_chat_run(state: &AppState, chat_id: i64, run_id: u64) {
     }
 }
 
+async fn store_bot_progress_message(state: &AppState, chat_id: i64, content: String) {
+    let bot_msg = StoredMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        chat_id,
+        sender_name: state.config.bot_username.clone(),
+        content,
+        is_from_bot: true,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
+}
+
 async fn spawn_telegram_agent_run(
     bot: Bot,
     state: Arc<AppState>,
@@ -422,25 +435,70 @@ async fn run_telegram_agent(
     }));
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let result = process_with_agent_with_events(
-        &state,
-        AgentRequestContext {
-            caller_channel: "telegram",
-            chat_id,
-            chat_type: runtime_chat_type,
-        },
-        None,
-        image_data,
-        Some(&event_tx),
-    )
-    .await;
+    let mut used_send_message_tool = false;
+    let mut external_delivery = false;
+    let mut last_progress_sent_at = Instant::now();
+    let result = {
+        let agent_event_tx = event_tx.clone();
+        let mut agent_future = std::pin::pin!(process_with_agent_with_events(
+            &state,
+            AgentRequestContext {
+                caller_channel: "telegram",
+                chat_id,
+                chat_type: runtime_chat_type,
+            },
+            None,
+            image_data,
+            Some(&agent_event_tx),
+        ));
+        loop {
+            tokio::select! {
+                completed = &mut agent_future => break completed,
+                maybe_event = event_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        continue;
+                    };
+                    match event {
+                        AgentEvent::ToolStart { name } => {
+                            if name == "send_message" {
+                                used_send_message_tool = true;
+                            }
+                        }
+                        AgentEvent::ExternalDelivery => {
+                            external_delivery = true;
+                        }
+                        AgentEvent::Iteration { iteration } => {
+                            if !used_send_message_tool
+                                && !external_delivery
+                                && iteration >= 8
+                                && last_progress_sent_at.elapsed() >= Duration::from_secs(20)
+                            {
+                                let progress = format!(
+                                    "Still working on this. {} steps completed so far.",
+                                    iteration
+                                );
+                                send_response(
+                                    &bot,
+                                    reply_target.chat_id,
+                                    reply_target.thread_id,
+                                    &progress,
+                                )
+                                .await;
+                                store_bot_progress_message(&state, chat_id, progress).await;
+                                last_progress_sent_at = Instant::now();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
     typing_guard.abort();
+    drop(event_tx);
 
     match result {
         Ok(response) => {
-            drop(event_tx);
-            let mut used_send_message_tool = false;
-            let mut external_delivery = false;
             while let Some(event) = event_rx.recv().await {
                 match event {
                     AgentEvent::ToolStart { name } => {
