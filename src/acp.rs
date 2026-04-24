@@ -341,7 +341,7 @@ fn spawn_agent_child(
     }
 }
 
-fn expand_home_path(path: &str) -> PathBuf {
+pub(crate) fn expand_home_path(path: &str) -> PathBuf {
     if path == "~" {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home);
@@ -349,6 +349,13 @@ fn expand_home_path(path: &str) -> PathBuf {
     } else if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(rest);
+        }
+    } else if !path.is_empty() && !path.starts_with('/') && !path.starts_with('.') {
+        if let Some(home) = std::env::var_os("HOME") {
+            let candidate = PathBuf::from(home).join(path);
+            if candidate.exists() {
+                return candidate;
+            }
         }
     }
     PathBuf::from(path)
@@ -1509,6 +1516,10 @@ pub type JobCompletionCallback = Arc<
         + Sync,
 >;
 
+pub type ChatSessionEndCallback = Arc<
+    dyn Fn(i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 fn format_progress_batch(events: &mut Vec<String>) -> Option<String> {
     use std::collections::BTreeMap;
 
@@ -1675,7 +1686,7 @@ fn spawn_progress_forwarder_with_interval(
 }
 
 /// Spawn a progress forwarder that quickly relays agent-authored text
-/// while batching tool events into 30-second summaries.
+/// while batching tool events into 60-second summaries.
 pub fn spawn_progress_forwarder(
     rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
@@ -1686,7 +1697,7 @@ pub fn spawn_progress_forwarder(
         rx,
         chat_id,
         callback,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         agent_name,
     )
 }
@@ -1722,6 +1733,11 @@ pub struct AcpManager {
     sessions: RwLock<HashMap<String, Arc<Mutex<AcpSession>>>>,
     /// Map chat_id → session_id for command-based ACP routing
     chat_sessions: RwLock<HashMap<i64, String>>,
+    /// Explicit direct ACP mode selected via `#new`, retained across idle reaps
+    /// so the next plain message can transparently recreate a session.
+    chat_direct_modes: RwLock<HashMap<i64, ChatDirectMode>>,
+    /// Hooks invoked after a chat-bound session is ended or reaped.
+    chat_session_end_callbacks: RwLock<Vec<ChatSessionEndCallback>>,
     /// Per-agent active session count for enforcing max_per_agent
     agent_session_counts: RwLock<HashMap<String, usize>>,
     /// In-memory async job store
@@ -1749,9 +1765,15 @@ impl AcpManager {
             config,
             sessions: RwLock::new(HashMap::new()),
             chat_sessions: RwLock::new(HashMap::new()),
+            chat_direct_modes: RwLock::new(HashMap::new()),
+            chat_session_end_callbacks: RwLock::new(Vec::new()),
             agent_session_counts: RwLock::new(HashMap::new()),
             jobs: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub async fn add_chat_session_end_callback(&self, callback: ChatSessionEndCallback) {
+        self.chat_session_end_callbacks.write().await.push(callback);
     }
 
     /// List configured agent names
@@ -2134,9 +2156,25 @@ impl AcpManager {
             }
         }
 
-        // Unbind any chats referencing this session
-        let mut chat_sessions = self.chat_sessions.write().await;
-        chat_sessions.retain(|_, sid| sid != session_id);
+        // Unbind any chats referencing this session and notify lifecycle hooks.
+        let affected_chat_ids = {
+            let mut chat_sessions = self.chat_sessions.write().await;
+            let affected_chat_ids = chat_sessions
+                .iter()
+                .filter_map(|(chat_id, sid)| (sid == session_id).then_some(*chat_id))
+                .collect::<Vec<_>>();
+            chat_sessions.retain(|_, sid| sid != session_id);
+            affected_chat_ids
+        };
+
+        if !affected_chat_ids.is_empty() {
+            let callbacks = self.chat_session_end_callbacks.read().await.clone();
+            for chat_id in affected_chat_ids {
+                for callback in &callbacks {
+                    callback(chat_id).await;
+                }
+            }
+        }
 
         info!("ACP session ended: {session_id}");
         Ok(())
@@ -2166,6 +2204,23 @@ impl AcpManager {
         summaries
     }
 
+    /// Fetch summary details for a single session without walking all sessions.
+    pub async fn session_summary(&self, session_id: &str) -> Option<SessionSummary> {
+        let session_mutex = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        }?;
+        let session = session_mutex.lock().await;
+        Some(SessionSummary {
+            session_id: session_id.to_string(),
+            agent_id: session.agent_id.clone(),
+            workspace: session.workspace.clone(),
+            status: session.status.clone(),
+            created_at: session.created_at.to_rfc3339(),
+            idle_secs: session.last_activity.elapsed().as_secs(),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Chat-to-session binding (for command-based ACP)
     // -----------------------------------------------------------------------
@@ -2180,6 +2235,29 @@ impl AcpManager {
         debug!("ACP: bound chat {chat_id} to session {session_id}");
     }
 
+    /// Bind a chat to an ACP session and remember the direct ACP mode selected
+    /// via `#new`, so the session can be recreated after idle reaping.
+    pub async fn bind_chat_direct_mode(
+        &self,
+        chat_id: i64,
+        session_id: &str,
+        agent_id: &str,
+        workspace: &str,
+    ) {
+        self.bind_chat(chat_id, session_id).await;
+        self.chat_direct_modes.write().await.insert(
+            chat_id,
+            ChatDirectMode {
+                agent_id: agent_id.to_string(),
+                workspace: workspace.to_string(),
+            },
+        );
+        debug!(
+            "ACP: remembered direct mode for chat {} (agent={}, workspace={})",
+            chat_id, agent_id, workspace
+        );
+    }
+
     /// Unbind a chat from its ACP session.
     pub async fn unbind_chat(&self, chat_id: i64) {
         self.chat_sessions.write().await.remove(&chat_id);
@@ -2191,20 +2269,37 @@ impl AcpManager {
         self.chat_sessions.read().await.get(&chat_id).cloned()
     }
 
+    /// Get explicit direct ACP mode, if this chat entered ACP via `#new`.
+    pub async fn chat_direct_mode(&self, chat_id: i64) -> Option<ChatDirectMode> {
+        self.chat_direct_modes.read().await.get(&chat_id).cloned()
+    }
+
+    /// Clear remembered direct ACP mode for this chat.
+    pub async fn clear_chat_direct_mode(&self, chat_id: i64) {
+        self.chat_direct_modes.write().await.remove(&chat_id);
+        debug!("ACP: cleared direct mode for chat {chat_id}");
+    }
+
     /// End the session bound to a chat and unbind it. Returns Ok if a session
     /// existed and was ended, Err if no session was bound.
     pub async fn end_chat_session(&self, chat_id: i64) -> Result<(), String> {
-        let session_id = self
-            .chat_sessions
-            .read()
-            .await
-            .get(&chat_id)
-            .cloned()
-            .ok_or_else(|| "No active ACP session in this chat".to_string())?;
+        let session_id = self.chat_sessions.read().await.get(&chat_id).cloned();
 
-        self.end_session(&session_id).await?;
-        self.unbind_chat(chat_id).await;
-        Ok(())
+        if session_id.is_none() {
+            if self.chat_direct_mode(chat_id).await.is_some() {
+                self.clear_chat_direct_mode(chat_id).await;
+                self.unbind_chat(chat_id).await;
+                return Ok(());
+            }
+            return Err("No active ACP session in this chat".to_string());
+        }
+
+        self.clear_chat_direct_mode(chat_id).await;
+        let result = self.end_session(session_id.as_deref().unwrap()).await;
+        if result.is_err() {
+            self.unbind_chat(chat_id).await;
+        }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -2509,6 +2604,12 @@ pub struct SessionSummary {
     pub idle_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatDirectMode {
+    pub agent_id: String,
+    pub workspace: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2700,6 +2801,19 @@ mod tests {
             expand_home_path("/Users/td/Projects/careai"),
             std::path::PathBuf::from("/Users/td/Projects/careai")
         );
+    }
+
+    #[test]
+    fn test_expand_home_path_prefers_existing_home_relative_candidate() {
+        let home = std::env::var_os("HOME").expect("HOME should be set for ACP tests");
+        let home = std::path::PathBuf::from(home);
+        let relative = format!("rayclaw-home-ws-{}", uuid::Uuid::new_v4());
+        let candidate = home.join(&relative);
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        assert_eq!(expand_home_path(&relative), candidate);
+
+        let _ = std::fs::remove_dir_all(home.join(relative));
     }
 
     #[test]
@@ -3450,7 +3564,7 @@ mod tests {
         assert_eq!(delivered.len(), 2);
         assert!(delivered[0].contains("started `bash`"));
         assert!(delivered[0].contains("finished `bash` with status `success`"));
-        assert_eq!(delivered[1], "Part one\nPart two");
+        assert_eq!(delivered[1], "*test-agent:* Part one\nPart two");
     }
 
     #[test]
@@ -3609,6 +3723,217 @@ mod tests {
         let result = manager.new_session("nonexistent-pty", None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_end_session_invokes_chat_end_callbacks() {
+        let manager = AcpManager::from_config(AcpConfig {
+            agents: HashMap::from([(
+                "codex".to_string(),
+                AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..AcpConfig::default()
+        });
+
+        let ended_chats = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let ended_chats_for_cb = ended_chats.clone();
+        manager
+            .add_chat_session_end_callback(Arc::new(move |chat_id| {
+                let ended_chats = ended_chats_for_cb.clone();
+                Box::pin(async move {
+                    ended_chats.lock().await.push(chat_id);
+                })
+            }))
+            .await;
+
+        let session = match manager.new_session("codex", Some("/tmp"), None).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        manager.bind_chat(42, &session.session_id).await;
+        manager.end_session(&session.session_id).await.unwrap();
+
+        assert_eq!(*ended_chats.lock().await, vec![42]);
+        assert!(manager.chat_session(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_end_chat_session_clears_direct_mode() {
+        let manager = AcpManager::from_config(AcpConfig {
+            agents: HashMap::from([(
+                "codex".to_string(),
+                AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..AcpConfig::default()
+        });
+
+        let session = match manager.new_session("codex", Some("/tmp"), None).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        manager
+            .bind_chat_direct_mode(42, &session.session_id, "codex", "/tmp")
+            .await;
+        manager.end_chat_session(42).await.unwrap();
+
+        assert!(manager.chat_session(42).await.is_none());
+        assert!(manager.chat_direct_mode(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_end_chat_session_clears_waiting_direct_mode_without_live_session() {
+        let manager = AcpManager::from_config(AcpConfig {
+            agents: HashMap::from([(
+                "codex".to_string(),
+                AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..AcpConfig::default()
+        });
+
+        let session = match manager.new_session("codex", Some("/tmp"), None).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        manager
+            .bind_chat_direct_mode(42, &session.session_id, "codex", "/tmp")
+            .await;
+        manager.end_session(&session.session_id).await.unwrap();
+
+        assert!(manager.chat_session(42).await.is_none());
+        assert_eq!(
+            manager.chat_direct_mode(42).await,
+            Some(ChatDirectMode {
+                agent_id: "codex".to_string(),
+                workspace: "/tmp".to_string(),
+            })
+        );
+
+        manager.end_chat_session(42).await.unwrap();
+
+        assert!(manager.chat_session(42).await.is_none());
+        assert!(manager.chat_direct_mode(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reap_idle_sessions_invokes_chat_end_callbacks() {
+        let manager = AcpManager::from_config(AcpConfig {
+            idle_timeout_secs: 1,
+            agents: HashMap::from([(
+                "codex".to_string(),
+                AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..AcpConfig::default()
+        });
+
+        let ended_chats = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let ended_chats_for_cb = ended_chats.clone();
+        manager
+            .add_chat_session_end_callback(Arc::new(move |chat_id| {
+                let ended_chats = ended_chats_for_cb.clone();
+                Box::pin(async move {
+                    ended_chats.lock().await.push(chat_id);
+                })
+            }))
+            .await;
+
+        let session = match manager.new_session("codex", Some("/tmp"), None).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        manager.bind_chat(43, &session.session_id).await;
+
+        let session_mutex = {
+            let sessions = manager.sessions.read().await;
+            sessions.get(&session.session_id).cloned().unwrap()
+        };
+        session_mutex.lock().await.last_activity = Instant::now() - Duration::from_secs(5);
+
+        let reaped = manager.reap_idle_sessions().await;
+        assert_eq!(reaped, 1);
+        assert_eq!(*ended_chats.lock().await, vec![43]);
+        assert!(manager.chat_session(43).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reap_idle_sessions_preserves_direct_mode_for_resume() {
+        let manager = AcpManager::from_config(AcpConfig {
+            idle_timeout_secs: 1,
+            agents: HashMap::from([(
+                "codex".to_string(),
+                AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..AcpConfig::default()
+        });
+
+        let session = match manager.new_session("codex", Some("/tmp"), None).await {
+            Ok(session) => session,
+            Err(_) => return,
+        };
+        manager
+            .bind_chat_direct_mode(43, &session.session_id, "codex", "/tmp")
+            .await;
+
+        let session_mutex = {
+            let sessions = manager.sessions.read().await;
+            sessions.get(&session.session_id).cloned().unwrap()
+        };
+        session_mutex.lock().await.last_activity = Instant::now() - Duration::from_secs(5);
+
+        let reaped = manager.reap_idle_sessions().await;
+        assert_eq!(reaped, 1);
+        assert!(manager.chat_session(43).await.is_none());
+        assert_eq!(
+            manager.chat_direct_mode(43).await,
+            Some(ChatDirectMode {
+                agent_id: "codex".to_string(),
+                workspace: "/tmp".to_string(),
+            })
+        );
     }
 
     // -----------------------------------------------------------------------

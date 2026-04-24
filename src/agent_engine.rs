@@ -28,7 +28,25 @@ fn hash_tool_call(name: &str, input: &serde_json::Value) -> u64 {
 }
 
 const COMPACTION_SUMMARIZATION_TIMEOUT_SECS: u64 = 15;
-const AGENT_TURN_TIMEOUT_SECS: u64 = 120;
+const AGENT_STALL_TIMEOUT_SECS: u64 = 120;
+
+fn looks_like_acp_workspace_arg(arg: &str) -> bool {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return false;
+    }
+    if arg.starts_with('/') || arg.starts_with('.') || arg.starts_with('~') || arg.contains('/') {
+        return true;
+    }
+
+    crate::acp::expand_home_path(arg) != std::path::PathBuf::from(arg)
+}
+
+fn is_unrecoverable_direct_acp_error(error: &str) -> bool {
+    error.contains("recovery failed")
+        || error.contains("has ended")
+        || error.contains("has no ACP session ID")
+}
 
 struct LoopDetector {
     /// Recent tool calls, newest at the tail.
@@ -560,10 +578,11 @@ async fn maybe_handle_acp(
 
                 let agent_name = parts[1];
                 // Only treat the third token as a workspace path if it looks
-                // like one (starts with '/' or '.').  Extra text like
-                // "#new claude 测试一下" should be ignored, not used as cwd.
+                // like one. Support ~-expanded paths and home-relative tokens
+                // like "Projects/foo" when they resolve under HOME. Extra text
+                // like "#new claude 测试一下" should still be ignored.
                 let workspace = parts.get(2).and_then(|s| {
-                    if s.starts_with('/') || s.starts_with('.') {
+                    if looks_like_acp_workspace_arg(s) {
                         Some(*s)
                     } else {
                         None
@@ -583,7 +602,15 @@ async fn maybe_handle_acp(
                     .await
                 {
                     Ok(info) => {
-                        state.acp_manager.bind_chat(chat_id, &info.session_id).await;
+                        state
+                            .acp_manager
+                            .bind_chat_direct_mode(
+                                chat_id,
+                                &info.session_id,
+                                &info.agent_id,
+                                &info.workspace,
+                            )
+                            .await;
                         Ok(Some(format!(
                             "ACP session started.\nAgent: {}\nWorkspace: {}\nSession: {}\n\nSend messages to interact with the agent. Use #end to stop.",
                             info.agent_id, info.workspace, info.session_id
@@ -627,6 +654,36 @@ async fn maybe_handle_acp(
                     Ok(Some(format!("Active ACP sessions:\n{list}")))
                 }
             }
+            "#status" => {
+                if let Some(session_id) = state.acp_manager.chat_session(chat_id).await {
+                    if let Some(session) = state.acp_manager.session_summary(&session_id).await {
+                        Ok(Some(format!(
+                            "mode: acp\nagent: {}\nworkspace: {}\nsession: {}\nstatus: {:?}\nidle: {}s",
+                            session.agent_id,
+                            session.workspace,
+                            session.session_id,
+                            session.status,
+                            session.idle_secs
+                        )))
+                    } else if let Some(mode) = state.acp_manager.chat_direct_mode(chat_id).await {
+                        Ok(Some(format!(
+                            "mode: acp\nagent: {}\nworkspace: {}\nsession: inactive\nstatus: waiting_for_resume",
+                            mode.agent_id, mode.workspace
+                        )))
+                    } else {
+                        Ok(Some(format!(
+                            "mode: rayclaw\nwarning: bound ACP session `{session_id}` is unavailable"
+                        )))
+                    }
+                } else if let Some(mode) = state.acp_manager.chat_direct_mode(chat_id).await {
+                    Ok(Some(format!(
+                        "mode: acp\nagent: {}\nworkspace: {}\nsession: inactive\nstatus: waiting_for_resume",
+                        mode.agent_id, mode.workspace
+                    )))
+                } else {
+                    Ok(Some("mode: rayclaw".to_string()))
+                }
+            }
             "#help" if state.acp_manager.config.agents.is_empty() => {
                 // No ACP configured, don't handle #help
                 Ok(None)
@@ -637,6 +694,7 @@ async fn maybe_handle_acp(
                  #end — End the current session\n\
                  #agents — List available agents\n\
                  #sessions — List active sessions\n\
+                 #status — Show the current chat mode\n\
                  #help — Show this help"
                     .to_string(),
             )),
@@ -647,18 +705,50 @@ async fn maybe_handle_acp(
         }
     } else {
         // Not a # command — check if chat has an active ACP session
-        if let Some(session_id) = state.acp_manager.chat_session(chat_id).await {
+        let mut session_id = state.acp_manager.chat_session(chat_id).await;
+        if let Some(existing_session_id) = session_id.as_deref() {
+            if state
+                .acp_manager
+                .session_summary(existing_session_id)
+                .await
+                .is_none()
+            {
+                state.acp_manager.unbind_chat(chat_id).await;
+                session_id = None;
+            }
+        }
+
+        if session_id.is_none() {
+            if let Some(mode) = state.acp_manager.chat_direct_mode(chat_id).await {
+                match state
+                    .acp_manager
+                    .new_session(&mode.agent_id, Some(&mode.workspace), None)
+                    .await
+                {
+                    Ok(info) => {
+                        state.acp_manager.bind_chat(chat_id, &info.session_id).await;
+                        session_id = Some(info.session_id);
+                    }
+                    Err(e) => {
+                        state.acp_manager.clear_chat_direct_mode(chat_id).await;
+                        return Ok(Some(format!(
+                            "ACP auto-resume failed: {e}. Direct ACP mode was cleared. Use #new to start a fresh ACP session."
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(session_id) = session_id {
             // Set up progress streaming channel
             let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Resolve agent name from session for progress prefix
             let agent_name = state
                 .acp_manager
-                .list_sessions()
+                .session_summary(&session_id)
                 .await
-                .iter()
-                .find(|s| s.session_id == session_id)
-                .map(|s| s.agent_id.clone())
+                .map(|s| s.agent_id)
                 .unwrap_or_else(|| "agent".to_string());
 
             let progress_handle = spawn_acp_progress_consumer(
@@ -691,7 +781,21 @@ async fn maybe_handle_acp(
                         Ok(Some(result.forwarded_text()))
                     }
                 }
-                Err(e) => Ok(Some(format!("ACP error: {e}"))),
+                Err(e) => {
+                    if is_unrecoverable_direct_acp_error(&e)
+                        && state.acp_manager.chat_direct_mode(chat_id).await.is_some()
+                    {
+                        state.acp_manager.clear_chat_direct_mode(chat_id).await;
+                        if let Err(cleanup_err) = state.acp_manager.end_session(&session_id).await {
+                            warn!(
+                                "Failed to fully clean up unrecoverable ACP direct session {}: {}",
+                                session_id, cleanup_err
+                            );
+                            state.acp_manager.unbind_chat(chat_id).await;
+                        }
+                    }
+                    Ok(Some(format!("ACP error: {e}")))
+                }
             }
         } else {
             // No active session, continue to normal LLM
@@ -741,7 +845,7 @@ pub(crate) async fn process_with_agent_impl(
     event_tx: Option<&UnboundedSender<AgentEvent>>,
 ) -> anyhow::Result<String> {
     let chat_id = context.chat_id;
-    let agent_turn_started = std::time::Instant::now();
+    let mut last_meaningful_progress_at = std::time::Instant::now();
     let mut last_tool_name: Option<String> = None;
 
     // Acquire per-chat lock to prevent concurrent agent loops for the same chat.
@@ -977,21 +1081,23 @@ pub(crate) async fn process_with_agent_impl(
     // Agentic tool-use loop
     let mut unresolved_failed_tools: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    let mut last_failed_tool_signatures: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     let mut empty_visible_reply_retry_attempted = false;
     let mut loop_detector = LoopDetector::new(state.config.max_loop_repeats);
     let mut overflow_recovery_attempted = false;
     for iteration in 0..state.config.max_tool_iterations {
-        if agent_turn_started.elapsed().as_secs() >= AGENT_TURN_TIMEOUT_SECS {
+        let stall_elapsed_secs = last_meaningful_progress_at.elapsed().as_secs();
+        if stall_elapsed_secs >= AGENT_STALL_TIMEOUT_SECS {
             clear_todo(&state.config.data_dir, chat_id);
-            let elapsed_secs = agent_turn_started.elapsed().as_secs();
             let timeout_msg = if let Some(tool_name) = last_tool_name.as_deref() {
                 format!(
-                    "I stopped after {elapsed_secs}s and {} tool iterations while still working through `{tool_name}`. Please ask me to continue or narrow the task.",
+                    "I stopped after {stall_elapsed_secs}s without meaningful progress and {} tool iterations while still working through `{tool_name}`. Please ask me to continue or narrow the task.",
                     iteration
                 )
             } else {
                 format!(
-                    "I stopped after {elapsed_secs}s and {} tool iterations without reaching a final answer. Please ask me to continue or narrow the task.",
+                    "I stopped after {stall_elapsed_secs}s without meaningful progress and {} tool iterations. Please ask me to continue or narrow the task.",
                     iteration
                 )
             };
@@ -1067,6 +1173,7 @@ pub(crate) async fn process_with_agent_impl(
                     recover_from_overflow(state, context.caller_channel, chat_id, &mut messages)
                         .await;
                 if recovered {
+                    last_meaningful_progress_at = std::time::Instant::now();
                     continue; // retry with compacted messages
                 }
                 // Recovery failed — return a user-friendly message
@@ -1208,6 +1315,11 @@ pub(crate) async fn process_with_agent_impl(
         }
 
         if stop_reason == "tool_use" {
+            let tool_use_count = response
+                .content
+                .iter()
+                .filter(|block| matches!(block, ResponseContentBlock::ToolUse { .. }))
+                .count();
             let assistant_content: Vec<ContentBlock> = response
                 .content
                 .iter()
@@ -1238,6 +1350,7 @@ pub(crate) async fn process_with_agent_impl(
             let mut tool_results = Vec::new();
             let mut loop_detected_tool = None;
             let mut loop_detected_error_preview = None;
+            let mut terminal_acp_result: Option<(String, String, bool)> = None;
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
                     last_tool_name = Some(name.clone());
@@ -1250,8 +1363,18 @@ pub(crate) async fn process_with_agent_impl(
                         .tools
                         .execute_with_auth(name, input.clone(), &tool_auth)
                         .await;
+                    let failure_signature = result
+                        .is_error
+                        .then(|| error_signature(result.error_type.as_deref(), &result.content))
+                        .flatten();
                     if result.is_error {
                         unresolved_failed_tools.insert(name.clone());
+                        let previous_signature = last_failed_tool_signatures
+                            .insert(name.clone(), failure_signature.clone())
+                            .flatten();
+                        if previous_signature.as_deref() != failure_signature.as_deref() {
+                            last_meaningful_progress_at = std::time::Instant::now();
+                        }
                         let preview = if result.content.chars().count() > 300 {
                             let clipped = result.content.chars().take(300).collect::<String>();
                             format!("{clipped}...")
@@ -1266,6 +1389,15 @@ pub(crate) async fn process_with_agent_impl(
                         );
                     } else {
                         unresolved_failed_tools.remove(name);
+                        last_failed_tool_signatures.remove(name);
+                        last_meaningful_progress_at = std::time::Instant::now();
+                        if matches!(name.as_str(), "acp_coding" | "acp_prompt") {
+                            terminal_acp_result = Some((
+                                name.clone(),
+                                result.content.clone(),
+                                result.delivered_directly,
+                            ));
+                        }
                     }
                     if let Some(tx) = event_tx {
                         let preview = if result.content.chars().count() > 160 {
@@ -1352,6 +1484,51 @@ pub(crate) async fn process_with_agent_impl(
                 role: "user".into(),
                 content: MessageContent::Blocks(tool_results),
             });
+
+            if tool_use_count == 1 {
+                if let Some((tool_name, terminal_content, delivered_directly)) = terminal_acp_result
+                {
+                    if delivered_directly {
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: MessageContent::Text(format!(
+                                "The visible response for `{tool_name}` was already delivered directly to the user, so this turn is complete."
+                            )),
+                        });
+                        strip_images_for_session(&mut messages);
+                        if let Ok(json) = serde_json::to_string(&messages) {
+                            let _ = call_blocking(state.db.clone(), move |db| {
+                                db.save_session(chat_id, &json)
+                            })
+                            .await;
+                        }
+                        clear_todo(&state.config.data_dir, chat_id);
+                        if let Some(tx) = event_tx {
+                            let _ = tx.send(AgentEvent::ExternalDelivery);
+                        }
+                        return Ok(String::new());
+                    }
+
+                    messages.push(Message {
+                        role: "assistant".into(),
+                        content: MessageContent::Text(terminal_content.clone()),
+                    });
+                    strip_images_for_session(&mut messages);
+                    if let Ok(json) = serde_json::to_string(&messages) {
+                        let _ = call_blocking(state.db.clone(), move |db| {
+                            db.save_session(chat_id, &json)
+                        })
+                        .await;
+                    }
+                    clear_todo(&state.config.data_dir, chat_id);
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(AgentEvent::FinalResponse {
+                            text: terminal_content.clone(),
+                        });
+                    }
+                    return Ok(terminal_content);
+                }
+            }
 
             continue;
         }
@@ -1725,7 +1902,8 @@ ACP coding guidance:
 - Prefer direct `bash`/`read_file`/local tools for quick debugging, focused inspection, or small edits inside the current runtime.
 - If chat memory already captures a preferred coding agent (for example Codex for school/personal or Claude for work), omit the `agent` parameter and let `acp_coding` resolve it from memory.
 - If `acp_coding` reports that the coding agent already delivered its visible response directly to the user, treat the task as complete and do not retry the same ACP call unless the user asks for more work.
-- The chat commands `#new`, `#end`, `#agents`, `#sessions`, `#help` are handled by the runtime when the user invokes them directly.
+- After a successful `acp_coding` or `acp_prompt` call, do not start another ACP delegation in the same turn unless the tool explicitly failed or the user asked for additional work.
+- The chat commands `#new`, `#end`, `#agents`, `#sessions`, `#status`, `#help` are handled by the runtime when the user invokes them directly.
 
 Browser automation guidance:
 - Use `agent_browser` only when you need a real rendered webpage or interactive browser behavior.
@@ -2311,7 +2489,10 @@ async fn compact_messages(
 
 #[cfg(all(test, feature = "web"))]
 mod tests {
-    use super::{build_db_memory_context, process_with_agent, AgentRequestContext};
+    use super::{
+        build_db_memory_context, looks_like_acp_workspace_arg, process_with_agent,
+        process_with_agent_with_events, AgentEvent, AgentRequestContext,
+    };
     use crate::channel_adapter::ChannelRegistry;
     use crate::config::{Config, WorkingDirIsolation};
     use crate::db::{Database, StoredMessage};
@@ -2324,7 +2505,7 @@ mod tests {
     use crate::memory::MemoryManager;
     use crate::runtime::AppState;
     use crate::skills::SkillManager;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{Tool, ToolRegistry, ToolResult};
     use crate::web::WebAdapter;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2346,6 +2527,102 @@ mod tests {
                 stop_reason: Some("end_turn".to_string()),
                 usage: None,
             })
+        }
+    }
+
+    struct OneShotAcpLlm {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for OneShotAcpLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<MessagesResponse, RayClawError> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            let response = match idx {
+                0 => MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: "acp_once".to_string(),
+                        name: "acp_coding".to_string(),
+                        input: serde_json::json!({
+                            "message": "Fix the bug and report back."
+                        }),
+                    }],
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: None,
+                },
+                _ => MessagesResponse {
+                    content: vec![ResponseContentBlock::Text {
+                        text: "unexpected second LLM turn".to_string(),
+                    }],
+                    stop_reason: Some("end_turn".to_string()),
+                    usage: None,
+                },
+            };
+            Ok(response)
+        }
+    }
+
+    struct DirectDeliveryAcpTool;
+
+    #[async_trait::async_trait]
+    impl Tool for DirectDeliveryAcpTool {
+        fn name(&self) -> &str {
+            "acp_coding"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "acp_coding".to_string(),
+                description: "test acp tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            }
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> ToolResult {
+            ToolResult::success(
+                "ACP task completed successfully. The coding agent's visible response was already delivered directly to the user in chat."
+                    .to_string(),
+            )
+            .with_direct_delivery()
+        }
+    }
+
+    struct SuccessfulAcpTool;
+
+    #[async_trait::async_trait]
+    impl Tool for SuccessfulAcpTool {
+        fn name(&self) -> &str {
+            "acp_coding"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "acp_coding".to_string(),
+                description: "test acp tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            }
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> ToolResult {
+            ToolResult::success(
+                "ACP task completed successfully via `acp_coding`. Treat this result as complete for the current turn unless the user explicitly asks for more work."
+                    .to_string(),
+            )
         }
     }
 
@@ -2523,6 +2800,28 @@ mod tests {
     }
 
     fn test_state_with_llm(base_dir: &std::path::Path, llm: Box<dyn LlmProvider>) -> Arc<AppState> {
+        test_state_with_llm_and_tools(base_dir, llm, Vec::new())
+    }
+
+    fn test_state_with_llm_and_tools(
+        base_dir: &std::path::Path,
+        llm: Box<dyn LlmProvider>,
+        extra_tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<AppState> {
+        test_state_with_llm_tools_and_acp_config(
+            base_dir,
+            llm,
+            extra_tools,
+            crate::acp::AcpConfig::default(),
+        )
+    }
+
+    fn test_state_with_llm_tools_and_acp_config(
+        base_dir: &std::path::Path,
+        llm: Box<dyn LlmProvider>,
+        extra_tools: Vec<Box<dyn Tool>>,
+        acp_config: crate::acp::AcpConfig,
+    ) -> Arc<AppState> {
         let runtime_dir = base_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let mut cfg = Config {
@@ -2586,6 +2885,10 @@ mod tests {
         let mut registry = ChannelRegistry::new();
         registry.register(Arc::new(WebAdapter));
         let channel_registry = Arc::new(registry);
+        let mut tools = ToolRegistry::new(&cfg, channel_registry.clone(), db.clone());
+        for tool in extra_tools {
+            tools.add_tool(tool);
+        }
         Arc::new(AppState {
             config: cfg.clone(),
             channel_registry: channel_registry.clone(),
@@ -2594,10 +2897,11 @@ mod tests {
             skills: SkillManager::from_skills_dir(&cfg.skills_data_dir()),
             llm,
             embedding: None,
-            tools: ToolRegistry::new(&cfg, channel_registry, db),
-            acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config_file("")),
+            tools,
+            acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config(acp_config)),
             chat_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             chat_runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            telegram_acp_status_pins: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_chat_run_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -2612,6 +2916,20 @@ mod tests {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         db.store_message(&msg).unwrap();
+    }
+
+    #[test]
+    fn test_looks_like_acp_workspace_arg_accepts_home_relative_candidate() {
+        let home = std::env::var_os("HOME").expect("HOME should be set for tests");
+        let home = std::path::PathBuf::from(home);
+        let relative = format!("rayclaw-agent-ws-{}", uuid::Uuid::new_v4());
+        let candidate = home.join(&relative);
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        assert!(looks_like_acp_workspace_arg(&relative));
+        assert!(!looks_like_acp_workspace_arg("测试一下"));
+
+        let _ = std::fs::remove_dir_all(candidate);
     }
 
     #[tokio::test]
@@ -2896,9 +3214,9 @@ mod tests {
         let reply = process_with_agent(
             &state,
             AgentRequestContext {
-                caller_channel: "web",
+                caller_channel: "test",
                 chat_id,
-                chat_type: "web",
+                chat_type: "private",
             },
             None,
             None,
@@ -2908,6 +3226,120 @@ mod tests {
 
         assert_eq!(reply, "Visible retry answer.");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_direct_delivery_acp_tool_stops_without_second_llm_turn() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_acp_direct_delivery_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = test_state_with_llm_and_tools(
+            &base_dir,
+            Box::new(OneShotAcpLlm {
+                calls: calls.clone(),
+            }),
+            vec![Box::new(DirectDeliveryAcpTool)],
+        );
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "acp-direct-delivery-chat", Some("acp"), "web")
+            .unwrap();
+        store_user_message(&state.db, chat_id, "Please fix this via ACP.");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reply = process_with_agent_with_events(
+            &state,
+            AgentRequestContext {
+                caller_channel: "test",
+                chat_id,
+                chat_type: "private",
+            },
+            None,
+            None,
+            Some(&event_tx),
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+
+        let mut saw_external_delivery = false;
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, AgentEvent::ExternalDelivery) {
+                saw_external_delivery = true;
+            }
+        }
+
+        assert!(reply.is_empty(), "expected empty final reply, got: {reply}");
+        assert!(saw_external_delivery, "expected ExternalDelivery event");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (saved, _) = state.db.load_session(chat_id).unwrap().unwrap();
+        let messages: Vec<Message> = serde_json::from_str(&saved).unwrap();
+        assert!(matches!(
+            messages.last(),
+            Some(Message {
+                role,
+                content: MessageContent::Text(text),
+            }) if role == "assistant" && text.contains("already delivered directly")
+        ));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_successful_acp_tool_stops_without_second_llm_turn() {
+        let base_dir =
+            std::env::temp_dir().join(format!("mc_agent_acp_success_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = test_state_with_llm_and_tools(
+            &base_dir,
+            Box::new(OneShotAcpLlm {
+                calls: calls.clone(),
+            }),
+            vec![Box::new(SuccessfulAcpTool)],
+        );
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "acp-success-chat", Some("acp"), "web")
+            .unwrap();
+        store_user_message(&state.db, chat_id, "Please fix this via ACP.");
+
+        let reply = process_with_agent(
+            &state,
+            AgentRequestContext {
+                caller_channel: "test",
+                chat_id,
+                chat_type: "private",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            reply.contains("ACP task completed successfully via `acp_coding`"),
+            "unexpected ACP reply: {reply}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (saved, _) = state.db.load_session(chat_id).unwrap().unwrap();
+        let messages: Vec<Message> = serde_json::from_str(&saved).unwrap();
+        assert!(matches!(
+            messages.last(),
+            Some(Message {
+                role,
+                content: MessageContent::Text(text),
+            }) if role == "assistant" && text.contains("ACP task completed successfully via `acp_coding`")
+        ));
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base_dir);
@@ -3039,6 +3471,336 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_acp_status_is_chat_scoped_between_general_and_topic_chats() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_acp_status_chat_scope_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let acp_config = crate::acp::AcpConfig {
+            agents: std::collections::HashMap::from([(
+                "codex".to_string(),
+                crate::acp::AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..crate::acp::AcpConfig::default()
+        };
+        let state = test_state_with_llm_tools_and_acp_config(
+            &base_dir,
+            Box::new(DummyLlm),
+            Vec::new(),
+            acp_config,
+        );
+
+        let general_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189",
+                Some("TD-Rayclaw"),
+                "telegram_supergroup",
+            )
+            .unwrap();
+        let topic_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("TD-Rayclaw / Topic 57"),
+                "telegram_topic",
+            )
+            .unwrap();
+
+        let session = match state
+            .acp_manager
+            .new_session("codex", Some(base_dir.to_str().unwrap()), None)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => {
+                drop(state);
+                let _ = std::fs::remove_dir_all(&base_dir);
+                return;
+            }
+        };
+        state
+            .acp_manager
+            .bind_chat(topic_chat_id, &session.session_id)
+            .await;
+
+        store_user_message(&state.db, general_chat_id, "#status");
+        let general_status =
+            super::maybe_handle_acp(&state, general_chat_id, None, &None, None).await;
+        assert_eq!(general_status.unwrap(), Some("mode: rayclaw".to_string()));
+
+        store_user_message(&state.db, topic_chat_id, "#status");
+        let topic_status = super::maybe_handle_acp(&state, topic_chat_id, None, &None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(topic_status.contains("mode: acp"));
+        assert!(topic_status.contains("agent: codex"));
+        assert!(topic_status.contains(&format!("session: {}", session.session_id)));
+
+        state
+            .acp_manager
+            .end_chat_session(topic_chat_id)
+            .await
+            .unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_direct_acp_auto_resumes_after_reap() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_acp_resume_after_reap_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let acp_config = crate::acp::AcpConfig {
+            agents: std::collections::HashMap::from([(
+                "codex".to_string(),
+                crate::acp::AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "cat".to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..crate::acp::AcpConfig::default()
+        };
+        let state = test_state_with_llm_tools_and_acp_config(
+            &base_dir,
+            Box::new(DummyLlm),
+            Vec::new(),
+            acp_config,
+        );
+
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "acp-resume-chat", Some("acp"), "web")
+            .unwrap();
+
+        let session = match state
+            .acp_manager
+            .new_session("codex", Some(base_dir.to_str().unwrap()), None)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => {
+                drop(state);
+                let _ = std::fs::remove_dir_all(&base_dir);
+                return;
+            }
+        };
+        state
+            .acp_manager
+            .bind_chat_direct_mode(
+                chat_id,
+                &session.session_id,
+                "codex",
+                base_dir.to_str().unwrap(),
+            )
+            .await;
+        state
+            .acp_manager
+            .end_session(&session.session_id)
+            .await
+            .unwrap();
+
+        assert!(state.acp_manager.chat_session(chat_id).await.is_none());
+        assert!(state.acp_manager.chat_direct_mode(chat_id).await.is_some());
+
+        store_user_message(&state.db, chat_id, "#status");
+        let waiting_status = super::maybe_handle_acp(&state, chat_id, None, &None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(waiting_status.contains("mode: acp"));
+        assert!(waiting_status.contains("status: waiting_for_resume"));
+
+        store_user_message(&state.db, chat_id, "resume this ACP session");
+        let reply = super::maybe_handle_acp(&state, chat_id, None, &None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.contains("resume this ACP session"));
+        assert!(state.acp_manager.chat_session(chat_id).await.is_some());
+        assert!(state.acp_manager.chat_direct_mode(chat_id).await.is_some());
+
+        state.acp_manager.end_chat_session(chat_id).await.unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn test_acp_topic_sessions_run_in_parallel() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mc_agent_acp_parallel_topics_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let acp_config = crate::acp::AcpConfig {
+            agents: std::collections::HashMap::from([(
+                "codex".to_string(),
+                crate::acp::AcpAgentConfig {
+                    mode: "pty".to_string(),
+                    launch: "binary".to_string(),
+                    command: "sh".to_string(),
+                    args: vec!["-lc".to_string(), "sleep 3; echo topic reply".to_string()],
+                    env: std::collections::HashMap::new(),
+                    workspace: None,
+                    auto_approve: None,
+                    resource_limits: None,
+                },
+            )]),
+            ..crate::acp::AcpConfig::default()
+        };
+        let state = test_state_with_llm_tools_and_acp_config(
+            &base_dir,
+            Box::new(DummyLlm),
+            Vec::new(),
+            acp_config,
+        );
+
+        let topic_a_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:57",
+                Some("TD-Rayclaw / Topic 57"),
+                "telegram_topic",
+            )
+            .unwrap();
+        let topic_b_chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "telegram",
+                "-1003910870189:58",
+                Some("TD-Rayclaw / Topic 58"),
+                "telegram_topic",
+            )
+            .unwrap();
+        assert_ne!(topic_a_chat_id, topic_b_chat_id);
+
+        let session_a = match state
+            .acp_manager
+            .new_session("codex", Some(base_dir.to_str().unwrap()), None)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => {
+                drop(state);
+                let _ = std::fs::remove_dir_all(&base_dir);
+                return;
+            }
+        };
+        let session_b = match state
+            .acp_manager
+            .new_session("codex", Some(base_dir.to_str().unwrap()), None)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => {
+                state
+                    .acp_manager
+                    .end_session(&session_a.session_id)
+                    .await
+                    .ok();
+                drop(state);
+                let _ = std::fs::remove_dir_all(&base_dir);
+                return;
+            }
+        };
+        state
+            .acp_manager
+            .bind_chat(topic_a_chat_id, &session_a.session_id)
+            .await;
+        state
+            .acp_manager
+            .bind_chat(topic_b_chat_id, &session_b.session_id)
+            .await;
+
+        store_user_message(&state.db, topic_a_chat_id, "topic A work");
+        store_user_message(&state.db, topic_b_chat_id, "topic B work");
+
+        let topic_a_state = state.clone();
+        let topic_a_task = tokio::spawn(async move {
+            process_with_agent(
+                &topic_a_state,
+                AgentRequestContext {
+                    caller_channel: "telegram",
+                    chat_id: topic_a_chat_id,
+                    chat_type: "group",
+                },
+                None,
+                None,
+            )
+            .await
+        });
+
+        let topic_b_state = state.clone();
+        let topic_b_task = tokio::spawn(async move {
+            process_with_agent(
+                &topic_b_state,
+                AgentRequestContext {
+                    caller_channel: "telegram",
+                    chat_id: topic_b_chat_id,
+                    chat_type: "group",
+                },
+                None,
+                None,
+            )
+            .await
+        });
+
+        let start = tokio::time::Instant::now();
+        let (topic_a_reply, topic_b_reply) =
+            tokio::time::timeout(std::time::Duration::from_millis(5000), async {
+                tokio::join!(topic_a_task, topic_b_task)
+            })
+            .await
+            .expect("ACP topic sessions should not serialize onto one chat slot");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(5000),
+            "ACP topic sessions unexpectedly serialized: elapsed={elapsed:?}"
+        );
+        assert_eq!(topic_a_reply.unwrap().unwrap(), "topic reply");
+        assert_eq!(topic_b_reply.unwrap().unwrap(), "topic reply");
+
+        state
+            .acp_manager
+            .end_chat_session(topic_a_chat_id)
+            .await
+            .unwrap();
+        state
+            .acp_manager
+            .end_chat_session(topic_b_chat_id)
+            .await
+            .unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
     async fn test_telegram_general_and_topic_chats_run_in_parallel() {
         let base_dir = std::env::temp_dir().join(format!(
             "mc_agent_telegram_parallel_topics_{}",
@@ -3157,6 +3919,9 @@ mod tests {
         assert!(prompt.contains("not a provider-native browsing capability"));
         assert!(prompt
             .contains("Use `acp_coding` only when an external coding agent is clearly beneficial"));
+        assert!(prompt.contains(
+            "After a successful `acp_coding` or `acp_prompt` call, do not start another ACP delegation in the same turn"
+        ));
         assert!(prompt.contains("If a task clearly matches an available skill such as `coding-agent`, load it before proceeding"));
     }
 
