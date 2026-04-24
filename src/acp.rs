@@ -1520,31 +1520,134 @@ pub type ChatSessionEndCallback = Arc<
     dyn Fn(i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
 
-fn format_progress_batch(events: &mut Vec<String>) -> Option<String> {
-    use std::collections::BTreeMap;
+const PROGRESS_SUMMARY_SILENCE_THRESHOLD: Duration = Duration::from_secs(120);
+const PROGRESS_RECENT_ACTIVITY_LIMIT: usize = 3;
+const PROGRESS_ACTIVITY_LABEL_MAX_CHARS: usize = 96;
 
-    if events.is_empty() {
+#[derive(Debug, Default, Clone)]
+struct PendingToolProgress {
+    started: usize,
+    completed: usize,
+    failed: usize,
+    cancelled: usize,
+    recent_activity: Vec<String>,
+}
+
+impl PendingToolProgress {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.started == 0
+            && self.completed == 0
+            && self.failed == 0
+            && self.cancelled == 0
+            && self.recent_activity.is_empty()
+    }
+
+    fn record_start(&mut self, name: &str) {
+        self.started += 1;
+        self.push_recent_activity(name);
+    }
+
+    fn record_completion(&mut self, name: &str, status: &str) {
+        match status {
+            "completed" | "success" => self.completed += 1,
+            "failed" => self.failed += 1,
+            "cancelled" => self.cancelled += 1,
+            _ => self.completed += 1,
+        }
+        self.push_recent_activity(name);
+    }
+
+    fn push_recent_activity(&mut self, name: &str) {
+        let Some(label) = summarize_tool_activity_label(name) else {
+            return;
+        };
+
+        if self.recent_activity.last() == Some(&label) {
+            return;
+        }
+
+        self.recent_activity.push(label);
+        if self.recent_activity.len() > PROGRESS_RECENT_ACTIVITY_LIMIT {
+            let overflow = self.recent_activity.len() - PROGRESS_RECENT_ACTIVITY_LIMIT;
+            self.recent_activity.drain(0..overflow);
+        }
+    }
+}
+
+fn summarize_tool_activity_label(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with("call_") {
         return None;
     }
 
-    let mut counts = BTreeMap::<String, usize>::new();
-    for event in events.drain(..) {
-        *counts.entry(event).or_insert(0) += 1;
+    let mut label = trimmed
+        .chars()
+        .take(PROGRESS_ACTIVITY_LABEL_MAX_CHARS)
+        .collect::<String>();
+    if trimmed.chars().count() > PROGRESS_ACTIVITY_LABEL_MAX_CHARS {
+        label.push_str("...");
     }
 
-    let lines = counts
-        .into_iter()
-        .map(|(event, count)| {
-            if count > 1 {
-                format!("- {event} x{count}")
-            } else {
-                format!("- {event}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    Some(format!("`{label}`"))
+}
 
-    Some(lines)
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        plural.to_string()
+    }
+}
+
+fn format_progress_summary(agent_name: &str, progress: &PendingToolProgress) -> Option<String> {
+    if progress.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![format!(
+        "*{agent_name}:* still working. No visible agent reply for about 2 minutes."
+    )];
+
+    if progress.started > 0 {
+        lines.push(format!(
+            "- {} {} started",
+            progress.started,
+            pluralize(progress.started, "tool action", "tool actions")
+        ));
+    }
+    if progress.completed > 0 {
+        lines.push(format!(
+            "- {} {} completed",
+            progress.completed,
+            pluralize(progress.completed, "action", "actions")
+        ));
+    }
+    if progress.failed > 0 {
+        lines.push(format!(
+            "- {} {} failed",
+            progress.failed,
+            pluralize(progress.failed, "action", "actions")
+        ));
+    }
+    if progress.cancelled > 0 {
+        lines.push(format!(
+            "- {} {} cancelled",
+            progress.cancelled,
+            pluralize(progress.cancelled, "action", "actions")
+        ));
+    }
+    if !progress.recent_activity.is_empty() {
+        lines.push(format!(
+            "- Recent activity: {}",
+            progress.recent_activity.join(", ")
+        ));
+    }
+
+    Some(lines.join("\n"))
 }
 
 fn agent_buffer_looks_complete(buffer: &str) -> bool {
@@ -1567,23 +1670,26 @@ fn spawn_progress_forwarder_with_interval(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
     callback: JobCompletionCallback,
-    flush_interval: Duration,
+    silence_threshold: Duration,
     agent_name: &str,
 ) -> tokio::task::JoinHandle<AcpProgressSummary> {
+    let agent_name = agent_name.to_string();
     let agent_prefix = format!("*{agent_name}:* ");
     tokio::spawn(async move {
-        let mut tool_ticker = tokio::time::interval(flush_interval);
-        tool_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let agent_complete_debounce = Duration::from_millis(900);
         let agent_incomplete_debounce = Duration::from_secs(5);
         let agent_max_hold = Duration::from_secs(8);
         let mut summary = AcpProgressSummary::default();
         let mut agent_buffer = String::new();
         let mut agent_buffer_started_at = None::<tokio::time::Instant>;
-        let mut tool_events = Vec::<String>::new();
+        let mut pending_tool_progress = PendingToolProgress::default();
         let far_future = tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 365);
         let mut agent_timer = std::pin::Pin::from(Box::new(tokio::time::sleep_until(far_future)));
+        let mut progress_timer =
+            std::pin::Pin::from(Box::new(tokio::time::sleep_until(far_future)));
         let mut agent_flush_armed = false;
+        let mut progress_summary_armed = false;
+        let mut last_visible_output_at = tokio::time::Instant::now();
 
         let flush_agent_buffer = |buffer: &mut String, prefix: &str| -> Option<String> {
             if buffer.trim().is_empty() {
@@ -1597,28 +1703,71 @@ fn spawn_progress_forwarder_with_interval(
             }
         };
 
+        let disarm_progress_timer = |timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+                                     armed: &mut bool| {
+            timer.as_mut().reset(far_future);
+            *armed = false;
+        };
+
+        let arm_progress_timer =
+            |timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+             armed: &mut bool,
+             last_visible_output_at: tokio::time::Instant,
+             pending_tool_progress: &PendingToolProgress| {
+                if pending_tool_progress.is_empty() {
+                    timer.as_mut().reset(far_future);
+                    *armed = false;
+                } else {
+                    timer
+                        .as_mut()
+                        .reset(last_visible_output_at + silence_threshold);
+                    *armed = true;
+                }
+            };
+
+        let note_visible_output =
+            |timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+             armed: &mut bool,
+             last_visible_output_at: &mut tokio::time::Instant,
+             pending_tool_progress: &mut PendingToolProgress| {
+                *last_visible_output_at = tokio::time::Instant::now();
+                pending_tool_progress.clear();
+                timer.as_mut().reset(far_future);
+                *armed = false;
+            };
+
         loop {
             tokio::select! {
-                _ = tool_ticker.tick() => {
-                    if let Some(text) = format_progress_batch(&mut tool_events) {
+                _ = &mut progress_timer, if progress_summary_armed => {
+                    if let Some(text) = format_progress_summary(&agent_name, &pending_tool_progress) {
                         summary.sent_progress_updates = true;
                         callback(chat_id, text).await;
+                        note_visible_output(
+                            &mut progress_timer,
+                            &mut progress_summary_armed,
+                            &mut last_visible_output_at,
+                            &mut pending_tool_progress,
+                        );
+                    } else {
+                        disarm_progress_timer(&mut progress_timer, &mut progress_summary_armed);
                     }
                 }
                 _ = &mut agent_timer, if agent_flush_armed => {
                     if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                         summary.forwarded_agent_text = true;
                         callback(chat_id, text).await;
+                        note_visible_output(
+                            &mut progress_timer,
+                            &mut progress_summary_armed,
+                            &mut last_visible_output_at,
+                            &mut pending_tool_progress,
+                        );
                     }
                     agent_buffer_started_at = None;
                     agent_flush_armed = false;
                 }
                 maybe_event = rx.recv() => match maybe_event {
                     Some(AcpProgressEvent::AgentMessage { text }) => {
-                        if let Some(summary_text) = format_progress_batch(&mut tool_events) {
-                            summary.sent_progress_updates = true;
-                            callback(chat_id, summary_text).await;
-                        }
                         let now = tokio::time::Instant::now();
                         let started_at = agent_buffer_started_at.get_or_insert(now);
                         agent_buffer.push_str(&text);
@@ -1626,6 +1775,12 @@ fn spawn_progress_forwarder_with_interval(
                             if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                                 summary.forwarded_agent_text = true;
                                 callback(chat_id, text).await;
+                                note_visible_output(
+                                    &mut progress_timer,
+                                    &mut progress_summary_armed,
+                                    &mut last_visible_output_at,
+                                    &mut pending_tool_progress,
+                                );
                             }
                             agent_buffer_started_at = None;
                             agent_flush_armed = false;
@@ -1646,25 +1801,43 @@ fn spawn_progress_forwarder_with_interval(
                         if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
+                            note_visible_output(
+                                &mut progress_timer,
+                                &mut progress_summary_armed,
+                                &mut last_visible_output_at,
+                                &mut pending_tool_progress,
+                            );
                         }
                         agent_buffer_started_at = None;
                         agent_flush_armed = false;
-                        tool_events.push(format!("started `{name}`"));
+                        pending_tool_progress.record_start(&name);
+                        arm_progress_timer(
+                            &mut progress_timer,
+                            &mut progress_summary_armed,
+                            last_visible_output_at,
+                            &pending_tool_progress,
+                        );
                     }
                     Some(AcpProgressEvent::ToolComplete { name, status }) => {
                         if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
                             summary.forwarded_agent_text = true;
                             callback(chat_id, text).await;
+                            note_visible_output(
+                                &mut progress_timer,
+                                &mut progress_summary_armed,
+                                &mut last_visible_output_at,
+                                &mut pending_tool_progress,
+                            );
                         }
                         agent_buffer_started_at = None;
                         agent_flush_armed = false;
-                        if name.starts_with("call_") {
-                            if status != "completed" {
-                                tool_events.push(format!("a tool finished with status `{status}`"));
-                            }
-                        } else {
-                            tool_events.push(format!("finished `{name}` with status `{status}`"));
-                        }
+                        pending_tool_progress.record_completion(&name, &status);
+                        arm_progress_timer(
+                            &mut progress_timer,
+                            &mut progress_summary_armed,
+                            last_visible_output_at,
+                            &pending_tool_progress,
+                        );
                     }
                     Some(AcpProgressEvent::Thinking { .. }) => {}
                     None => break,
@@ -1675,10 +1848,12 @@ fn spawn_progress_forwarder_with_interval(
         if let Some(text) = flush_agent_buffer(&mut agent_buffer, &agent_prefix) {
             summary.forwarded_agent_text = true;
             callback(chat_id, text).await;
-        }
-        if let Some(text) = format_progress_batch(&mut tool_events) {
-            summary.sent_progress_updates = true;
-            callback(chat_id, text).await;
+            note_visible_output(
+                &mut progress_timer,
+                &mut progress_summary_armed,
+                &mut last_visible_output_at,
+                &mut pending_tool_progress,
+            );
         }
 
         summary
@@ -1686,7 +1861,8 @@ fn spawn_progress_forwarder_with_interval(
 }
 
 /// Spawn a progress forwarder that quickly relays agent-authored text
-/// while batching tool events into 60-second summaries.
+/// while keeping routine tool activity silent unless the agent has gone
+/// user-visible silent for 2 minutes.
 pub fn spawn_progress_forwarder(
     rx: tokio::sync::mpsc::UnboundedReceiver<AcpProgressEvent>,
     chat_id: i64,
@@ -1697,7 +1873,7 @@ pub fn spawn_progress_forwarder(
         rx,
         chat_id,
         callback,
-        Duration::from_secs(60),
+        PROGRESS_SUMMARY_SILENCE_THRESHOLD,
         agent_name,
     )
 }
@@ -3524,7 +3700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_progress_forwarder_replays_agent_text_and_batches_tool_updates() {
+    async fn test_progress_forwarder_replays_agent_text_without_tool_chatter() {
         let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
         let delivered_for_cb = delivered.clone();
         let callback: JobCompletionCallback = Arc::new(move |_chat_id, text| {
@@ -3560,11 +3736,91 @@ mod tests {
         let delivered = delivered.lock().await.clone();
 
         assert!(summary.forwarded_agent_text);
+        assert!(!summary.sent_progress_updates);
+        assert_eq!(
+            delivered,
+            vec!["*test-agent:* Part one\nPart two".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_progress_forwarder_sends_summary_only_after_two_minutes_of_silence() {
+        let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delivered_for_cb = delivered.clone();
+        let callback: JobCompletionCallback = Arc::new(move |_chat_id, text| {
+            let delivered = delivered_for_cb.clone();
+            Box::pin(async move {
+                delivered.lock().await.push(text);
+            })
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
+        let handle = spawn_progress_forwarder(rx, 42, callback, "test-agent");
+
+        tx.send(AcpProgressEvent::ToolStart {
+            name: "List /Users/td/Projects/careai/assets".to_string(),
+        })
+        .unwrap();
+        tx.send(AcpProgressEvent::ToolComplete {
+            name: "Read transcription-service.ts".to_string(),
+            status: "failed".to_string(),
+        })
+        .unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert!(delivered.lock().await.is_empty());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        drop(tx);
+        let summary = handle.await.unwrap();
+        let delivered = delivered.lock().await.clone();
+
+        assert!(!summary.forwarded_agent_text);
         assert!(summary.sent_progress_updates);
-        assert_eq!(delivered.len(), 2);
-        assert!(delivered[0].contains("started `bash`"));
-        assert!(delivered[0].contains("finished `bash` with status `success`"));
-        assert_eq!(delivered[1], "*test-agent:* Part one\nPart two");
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("still working. No visible agent reply for about 2 minutes"));
+        assert!(delivered[0].contains("- 1 tool action started"));
+        assert!(delivered[0].contains("- 1 action failed"));
+        assert!(delivered[0].contains("Recent activity"));
+        assert!(delivered[0].contains("List /Users/td/Projects/careai/assets"));
+        assert!(delivered[0].contains("Read transcription-service.ts"));
+    }
+
+    #[tokio::test]
+    async fn test_progress_forwarder_does_not_emit_tool_only_noise_on_completion() {
+        let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delivered_for_cb = delivered.clone();
+        let callback: JobCompletionCallback = Arc::new(move |_chat_id, text| {
+            let delivered = delivered_for_cb.clone();
+            Box::pin(async move {
+                delivered.lock().await.push(text);
+            })
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AcpProgressEvent>();
+        let handle = spawn_progress_forwarder(rx, 42, callback, "test-agent");
+
+        tx.send(AcpProgressEvent::ToolStart {
+            name: "Run mkdir -p output/playwright".to_string(),
+        })
+        .unwrap();
+        tx.send(AcpProgressEvent::ToolComplete {
+            name: "Run mkdir -p output/playwright".to_string(),
+            status: "completed".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let summary = handle.await.unwrap();
+        let delivered = delivered.lock().await.clone();
+
+        assert!(!summary.forwarded_agent_text);
+        assert!(!summary.sent_progress_updates);
+        assert!(delivered.is_empty());
     }
 
     #[test]

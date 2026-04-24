@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::acp::{AcpManager, AcpProgressSummary, AcpPromptResult, JobCompletionCallback};
+use crate::acp::{
+    expand_home_path, AcpManager, AcpProgressSummary, AcpPromptResult, JobCompletionCallback,
+};
 use crate::db::{call_blocking, Database, Memory, StoredMessage};
 use crate::llm_types::ToolDefinition;
 use async_trait::async_trait;
@@ -59,7 +61,20 @@ fn direct_delivery_completion_message(tool_name: &str, result: &AcpPromptResult)
     };
 
     format!(
-        "ACP task completed successfully. The coding agent's visible response was already delivered directly to the user in chat. Treat this request as complete and do not call `{tool_name}` again for the same instruction unless the user explicitly asks for more work.{reset_note} Latest agent message preview: {preview}. {file_note}"
+        "ACP task completed successfully. The coding agent's visible response was already delivered directly to the user in chat. Treat this request as complete, end the current turn, and do not call `{tool_name}` again for the same instruction unless the user explicitly asks for more work.{reset_note} Latest agent message preview: {preview}. {file_note}"
+    )
+}
+
+fn sync_completion_message(tool_name: &str, result: &AcpPromptResult) -> String {
+    let reset_note = if result.context_reset {
+        " The ACP session was restarted before this run, so earlier ACP-only context was reset."
+    } else {
+        ""
+    };
+
+    format!(
+        "ACP task completed successfully via `{tool_name}`. Treat this result as complete for the current turn unless the user explicitly asks for more work.{reset_note}\n\nAgent summary:\n{}",
+        result.forwarded_text()
     )
 }
 
@@ -264,19 +279,6 @@ fn infer_agent_from_memories(chat_id: i64, context: &str, memories: &[Memory]) -
     None
 }
 
-fn expand_home_path(path: &str) -> PathBuf {
-    if path == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 fn workspace_candidate_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -369,7 +371,8 @@ impl Tool for AcpCodingTool {
                 If agent is omitted, it resolves the best agent from chat memory/context. \
                 Sends immediate notification to the user, then executes the task. \
                 For quick tasks the result is returned directly. \
-                If the agent response is streamed directly to the chat, treat that as completion and do not retry the same task automatically. \
+                A successful sync call normally completes the delegated work for the current turn. \
+                If the agent response is streamed directly to the chat, treat that as completion, end the turn, and do not retry the same task automatically. \
                 Set async=true for long-running tasks to get a job_id and receive results via push notification."
                 .into(),
             input_schema: schema_object(
@@ -539,8 +542,9 @@ impl Tool for AcpCodingTool {
                             "acp_coding",
                             &result,
                         ))
+                        .with_direct_delivery()
                     } else {
-                        ToolResult::success(result.forwarded_text())
+                        ToolResult::success(sync_completion_message("acp_coding", &result))
                     }
                 }
                 Err(e) => ToolResult::error(format!("Coding agent error: {e}"))
@@ -739,8 +743,9 @@ impl Tool for AcpPromptTool {
             Ok((result, progress_summary)) => {
                 if progress_summary.forwarded_agent_text {
                     ToolResult::success(direct_delivery_completion_message("acp_prompt", &result))
+                        .with_direct_delivery()
                 } else {
-                    ToolResult::success(result.forwarded_text())
+                    ToolResult::success(sync_completion_message("acp_prompt", &result))
                 }
             }
             Err(e) => {
@@ -1167,7 +1172,27 @@ mod tests {
         assert!(message.contains("completed successfully"));
         assert!(message.contains("already delivered directly"));
         assert!(message.contains("do not call `acp_coding` again"));
+        assert!(message.contains("end the current turn"));
         assert!(message.contains("src/tools/acp.rs"));
+        assert!(message.contains("Implemented the fix and added tests."));
+    }
+
+    #[test]
+    fn test_sync_completion_message_marks_result_complete() {
+        let result = AcpPromptResult {
+            messages: vec!["Implemented the fix and added tests.".to_string()],
+            tool_outputs: vec![],
+            tool_calls: vec![],
+            files_changed: vec![],
+            completed: true,
+            duration_ms: 1500,
+            context_reset: false,
+        };
+
+        let message = sync_completion_message("acp_coding", &result);
+        assert!(message.contains("ACP task completed successfully"));
+        assert!(message.contains("Treat this result as complete for the current turn"));
+        assert!(message.contains("Agent summary:"));
         assert!(message.contains("Implemented the fix and added tests."));
     }
 

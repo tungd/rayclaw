@@ -41,6 +41,7 @@ pub struct ToolResult {
     pub bytes: usize,
     pub duration_ms: Option<u128>,
     pub error_type: Option<String>,
+    pub delivered_directly: bool,
 }
 
 impl ToolResult {
@@ -53,6 +54,7 @@ impl ToolResult {
             bytes,
             duration_ms: None,
             error_type: None,
+            delivered_directly: false,
         }
     }
 
@@ -65,6 +67,7 @@ impl ToolResult {
             bytes,
             duration_ms: None,
             error_type: Some("tool_error".to_string()),
+            delivered_directly: false,
         }
     }
 
@@ -75,6 +78,11 @@ impl ToolResult {
 
     pub fn with_error_type(mut self, error_type: impl Into<String>) -> Self {
         self.error_type = Some(error_type.into());
+        self
+    }
+
+    pub fn with_direct_delivery(mut self) -> Self {
+        self.delivered_directly = true;
         self
     }
 }
@@ -609,6 +617,7 @@ mod tests {
         let r = ToolResult::success("ok".into());
         assert_eq!(r.content, "ok");
         assert!(!r.is_error);
+        assert!(!r.delivered_directly);
     }
 
     #[test]
@@ -616,6 +625,13 @@ mod tests {
         let r = ToolResult::error("fail".into());
         assert_eq!(r.content, "fail");
         assert!(r.is_error);
+        assert!(!r.delivered_directly);
+    }
+
+    #[test]
+    fn test_tool_result_direct_delivery_flag() {
+        let r = ToolResult::success("ok".into()).with_direct_delivery();
+        assert!(r.delivered_directly);
     }
 
     #[test]

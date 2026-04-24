@@ -805,8 +805,9 @@ async fn maybe_handle_acp(
 }
 
 /// Spawn a background task that relays ACP progress into the chat-facing
-/// callback pipeline: agent-authored text is forwarded quickly, while tool
-/// events are batched into periodic summaries.
+/// callback pipeline: agent-authored text is forwarded quickly, while routine
+/// tool activity stays silent unless the agent has been user-visible silent
+/// for a prolonged period.
 fn spawn_acp_progress_consumer(
     rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::AcpProgressEvent>,
     registry: std::sync::Arc<crate::channel_adapter::ChannelRegistry>,

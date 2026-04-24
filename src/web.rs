@@ -1418,15 +1418,17 @@ async fn send_and_store_response_with_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    deliver_and_store_bot_message(
-        &state.app_state.channel_registry,
-        state.app_state.db.clone(),
-        &state.app_state.config.bot_username,
-        chat_id,
-        &response,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !response.is_empty() {
+        deliver_and_store_bot_message(
+            &state.app_state.channel_registry,
+            state.app_state.db.clone(),
+            &state.app_state.config.bot_username,
+            chat_id,
+            &response,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -2104,7 +2106,8 @@ mod tests {
     use crate::config::{Config, WorkingDirIsolation};
     use crate::db::call_blocking;
     use crate::llm::LlmProvider;
-    use crate::{db::Database, memory::MemoryManager, skills::SkillManager, tools::ToolRegistry};
+    use crate::tools::{Tool, ToolRegistry, ToolResult};
+    use crate::{db::Database, memory::MemoryManager, skills::SkillManager};
     use crate::{error::RayClawError, llm_types::ResponseContentBlock};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -2224,7 +2227,91 @@ mod tests {
         }
     }
 
+    struct DirectDeliveryFlowLlm {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for DirectDeliveryFlowLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<crate::llm_types::Message>,
+            _tools: Option<Vec<crate::llm_types::ToolDefinition>>,
+        ) -> Result<crate::llm_types::MessagesResponse, RayClawError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Ok(crate::llm_types::MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: "acp_1".into(),
+                        name: "acp_coding".into(),
+                        input: json!({"message": "fix runtime bug"}),
+                    }],
+                    stop_reason: Some("tool_use".into()),
+                    usage: None,
+                });
+            }
+            Ok(crate::llm_types::MessagesResponse {
+                content: vec![ResponseContentBlock::Text {
+                    text: "unexpected second turn".into(),
+                }],
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            })
+        }
+    }
+
+    struct DirectDeliveryRecordingTool {
+        registry: Arc<ChannelRegistry>,
+        db: Arc<Database>,
+        bot_username: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for DirectDeliveryRecordingTool {
+        fn name(&self) -> &str {
+            "acp_coding"
+        }
+
+        fn definition(&self) -> crate::llm_types::ToolDefinition {
+            crate::llm_types::ToolDefinition {
+                name: "acp_coding".into(),
+                description: "test ACP direct-delivery tool".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            }
+        }
+
+        async fn execute(&self, input: serde_json::Value) -> ToolResult {
+            let chat_id = crate::tools::auth_context_from_input(&input)
+                .map(|ctx| ctx.caller_chat_id)
+                .expect("missing auth context");
+            crate::channel::deliver_and_store_bot_message(
+                &self.registry,
+                self.db.clone(),
+                &self.bot_username,
+                chat_id,
+                "ACP direct-delivery output",
+            )
+            .await
+            .expect("failed to record direct-delivery output");
+            ToolResult::success("ACP task completed successfully.".into()).with_direct_delivery()
+        }
+    }
+
     fn test_state(llm: Box<dyn LlmProvider>) -> Arc<AppState> {
+        test_state_with_options(llm, Vec::new(), false)
+    }
+
+    fn test_state_with_options(
+        llm: Box<dyn LlmProvider>,
+        extra_tools: Vec<Box<dyn Tool>>,
+        skip_tool_approval: bool,
+    ) -> Arc<AppState> {
         let mut cfg = Config {
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
@@ -2275,7 +2362,7 @@ mod tests {
             aws_session_token: None,
             aws_profile: None,
             soul_path: None,
-            skip_tool_approval: false,
+            skip_tool_approval,
             skills_dir: None,
             channels: std::collections::HashMap::new(),
             prompt_cache_ttl: "none".into(),
@@ -2290,6 +2377,10 @@ mod tests {
         let mut registry = ChannelRegistry::new();
         registry.register(Arc::new(WebAdapter));
         let channel_registry = Arc::new(registry);
+        let mut tools = ToolRegistry::new(&cfg, channel_registry.clone(), db.clone());
+        for tool in extra_tools {
+            tools.add_tool(tool);
+        }
         let state = AppState {
             config: cfg.clone(),
             channel_registry: channel_registry.clone(),
@@ -2298,10 +2389,11 @@ mod tests {
             skills: SkillManager::from_skills_dir(&cfg.skills_data_dir()),
             llm,
             embedding: None,
-            tools: ToolRegistry::new(&cfg, channel_registry, db),
+            tools,
             acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config_file("")),
             chat_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             chat_runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            telegram_acp_status_pins: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_chat_run_id: std::sync::atomic::AtomicU64::new(1),
         };
         Arc::new(state)
@@ -2492,6 +2584,88 @@ mod tests {
         assert!(replay_text.contains("event: replay_meta"));
         assert!(!replay_text.contains("event: delta"));
         assert!(!replay_text.contains("event: done"));
+    }
+
+    #[tokio::test]
+    async fn test_web_send_skips_empty_final_message_after_direct_delivery() {
+        let base_state = test_state_with_options(
+            Box::new(DirectDeliveryFlowLlm {
+                calls: AtomicUsize::new(0),
+            }),
+            Vec::new(),
+            true,
+        );
+        let registry = base_state.channel_registry.clone();
+        let db = base_state.db.clone();
+        let bot_username = base_state.config.bot_username.clone();
+
+        let mut tools = ToolRegistry::new(&base_state.config, registry.clone(), db.clone());
+        tools.add_tool(Box::new(DirectDeliveryRecordingTool {
+            registry: registry.clone(),
+            db: db.clone(),
+            bot_username,
+        }));
+
+        let state = Arc::new(AppState {
+            config: base_state.config.clone(),
+            channel_registry: registry,
+            db: db.clone(),
+            memory: MemoryManager::new(&base_state.config.runtime_data_dir()),
+            skills: SkillManager::from_skills_dir(&base_state.config.skills_data_dir()),
+            llm: Box::new(DirectDeliveryFlowLlm {
+                calls: AtomicUsize::new(0),
+            }),
+            embedding: None,
+            tools,
+            acp_manager: std::sync::Arc::new(crate::acp::AcpManager::from_config_file("")),
+            chat_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            chat_runs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            telegram_acp_status_pins: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            next_chat_run_id: std::sync::atomic::AtomicU64::new(1),
+        });
+
+        let web_state = WebState {
+            app_state: state.clone(),
+            auth_token: None,
+            run_hub: RunHub::default(),
+            session_hub: SessionHub::default(),
+            request_hub: RequestHub::default(),
+            limits: WebLimits::default(),
+        };
+        let app = build_router(web_state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_key":"main","sender_name":"u","message":"delegate via acp"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.get("response").and_then(|v| v.as_str()), Some(""));
+
+        let chat_id = call_blocking(db.clone(), move |d| {
+            d.resolve_or_create_chat_id("web", "main", Some("main"), "web")
+        })
+        .await
+        .unwrap();
+        let messages = call_blocking(db, move |d| d.get_all_messages(chat_id))
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "delegate via acp");
+        assert_eq!(messages[1].content, "ACP direct-delivery output");
+        assert!(messages.iter().all(|m| !m.content.is_empty()));
     }
 
     #[tokio::test]

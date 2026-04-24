@@ -33,7 +33,7 @@ openssl-vendored = ["dep:openssl"]
 
 [dependencies]
 teloxide = { version = "0.17", features = ["macros"], optional = true }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["json", "blocking", "stream", "multipart"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
