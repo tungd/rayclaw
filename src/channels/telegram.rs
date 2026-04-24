@@ -344,6 +344,204 @@ async fn clear_current_chat_run(state: &AppState, chat_id: i64, run_id: u64) {
     }
 }
 
+async fn telegram_target_for_internal_chat(
+    state: &AppState,
+    internal_chat_id: i64,
+) -> Option<TelegramTarget> {
+    let routing = match crate::channel::get_chat_routing(
+        &state.channel_registry,
+        state.db.clone(),
+        internal_chat_id,
+    )
+    .await
+    {
+        Ok(Some(routing)) => routing,
+        Ok(None) => return None,
+        Err(err) => {
+            warn!(
+                "Failed to resolve chat routing while syncing Telegram ACP status pin for chat {}: {}",
+                internal_chat_id, err
+            );
+            return None;
+        }
+    };
+    if routing.channel_name != "telegram" {
+        return None;
+    }
+
+    let external_chat_id = match call_blocking(state.db.clone(), move |db| {
+        db.get_chat_external_id(internal_chat_id)
+    })
+    .await
+    {
+        Ok(Some(external_chat_id)) => external_chat_id,
+        Ok(None) => return None,
+        Err(err) => {
+            warn!(
+                "Failed to load Telegram external chat id while syncing ACP status pin for chat {}: {}",
+                internal_chat_id, err
+            );
+            return None;
+        }
+    };
+    match parse_telegram_external_chat_id(&external_chat_id) {
+        Ok(target) => Some(target),
+        Err(err) => {
+            warn!(
+                "Failed to parse Telegram external chat id '{}' while syncing ACP status pin: {}",
+                external_chat_id, err
+            );
+            None
+        }
+    }
+}
+
+fn telegram_acp_status_text(
+    direct_mode: &crate::acp::ChatDirectMode,
+    session: Option<&crate::acp::SessionSummary>,
+) -> String {
+    if let Some(session) = session {
+        format!(
+            "**ACP Mode**\nagent: {}\nworkspace: {}\nstatus: {}\nsession: {}",
+            session.agent_id,
+            session.workspace,
+            format!("{:?}", session.status).to_lowercase(),
+            session.session_id
+        )
+    } else {
+        format!(
+            "**ACP Mode**\nagent: {}\nworkspace: {}\nstatus: waiting_for_resume\nsession: inactive",
+            direct_mode.agent_id, direct_mode.workspace
+        )
+    }
+}
+
+async fn edit_telegram_markdown_or_plain(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    text: &str,
+) -> bool {
+    let markdown_text = render_markdown_v2_safe(text);
+    match bot
+        .edit_message_text(chat_id, message_id, markdown_text)
+        .parse_mode(ParseMode::MarkdownV2)
+        .await
+    {
+        Ok(_) => true,
+        Err(err) => {
+            if err.to_string().contains("message is not modified") {
+                return true;
+            }
+            warn!("Telegram MarkdownV2 edit failed, falling back to plain text: {err}");
+            match bot.edit_message_text(chat_id, message_id, text).await {
+                Ok(_) => true,
+                Err(fallback_err) => {
+                    if fallback_err.to_string().contains("message is not modified") {
+                        return true;
+                    }
+                    warn!("Telegram plain text edit fallback failed: {fallback_err}");
+                    false
+                }
+            }
+        }
+    }
+}
+
+pub async fn sync_telegram_acp_status_pin(state: &AppState, internal_chat_id: i64) {
+    let direct_mode = state.acp_manager.chat_direct_mode(internal_chat_id).await;
+    let existing_message_id = {
+        let pins = state.telegram_acp_status_pins.lock().await;
+        pins.get(&internal_chat_id).copied().map(MessageId)
+    };
+
+    if direct_mode.is_none() && existing_message_id.is_none() {
+        return;
+    }
+
+    let Some(target) = telegram_target_for_internal_chat(state, internal_chat_id).await else {
+        return;
+    };
+    let telegram_cfg = telegram_runtime_config(state);
+    let bot = Bot::new(telegram_cfg.bot_token);
+
+    let Some(direct_mode) = direct_mode else {
+        let Some(message_id) = existing_message_id else {
+            return;
+        };
+        {
+            let mut pins = state.telegram_acp_status_pins.lock().await;
+            if pins.get(&internal_chat_id) == Some(&message_id.0) {
+                pins.remove(&internal_chat_id);
+            }
+        }
+        if let Err(err) = bot
+            .unpin_chat_message(target.chat_id)
+            .message_id(message_id)
+            .await
+        {
+            warn!(
+                "Failed to unpin Telegram ACP status message for chat {}: {err}",
+                target.chat_id.0
+            );
+        }
+        return;
+    };
+
+    let live_session =
+        if let Some(session_id) = state.acp_manager.chat_session(internal_chat_id).await {
+            state.acp_manager.session_summary(&session_id).await
+        } else {
+            None
+        };
+    let status_text = telegram_acp_status_text(&direct_mode, live_session.as_ref());
+
+    let final_message_id = if let Some(message_id) = existing_message_id {
+        if edit_telegram_markdown_or_plain(&bot, target.chat_id, message_id, &status_text).await {
+            message_id
+        } else if let Some(new_message_id) =
+            send_telegram_markdown_or_plain(&bot, target.chat_id, target.thread_id, &status_text)
+                .await
+        {
+            if let Err(err) = bot
+                .unpin_chat_message(target.chat_id)
+                .message_id(message_id)
+                .await
+            {
+                warn!(
+                    "Failed to unpin superseded Telegram ACP status message for chat {}: {err}",
+                    target.chat_id.0
+                );
+            }
+            new_message_id
+        } else {
+            return;
+        }
+    } else if let Some(new_message_id) =
+        send_telegram_markdown_or_plain(&bot, target.chat_id, target.thread_id, &status_text).await
+    {
+        new_message_id
+    } else {
+        return;
+    };
+
+    {
+        let mut pins = state.telegram_acp_status_pins.lock().await;
+        pins.insert(internal_chat_id, final_message_id.0);
+    }
+
+    if let Err(err) = bot
+        .pin_chat_message(target.chat_id, final_message_id)
+        .disable_notification(true)
+        .await
+    {
+        warn!(
+            "Failed to pin Telegram ACP status message for chat {}: {err}",
+            target.chat_id.0
+        );
+    }
+}
+
 async fn store_bot_progress_message(state: &AppState, chat_id: i64, content: String) {
     let bot_msg = StoredMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -561,6 +759,8 @@ async fn run_telegram_agent(
         }
     }
 
+    sync_telegram_acp_status_pin(&state, chat_id).await;
+
     clear_current_chat_run(&state, chat_id, run_id).await;
 }
 
@@ -616,6 +816,38 @@ async fn handle_message(
         conversation_thread_id,
         typing_target.thread_id
     );
+    let chat_id = {
+        let external_chat_id_for_lookup = external_chat_id.clone();
+        let external_chat_id_for_log = external_chat_id.clone();
+        let chat_title_for_lookup = chat_title.clone();
+        let chat_type_for_lookup = db_chat_type.to_string();
+        match call_blocking(state.db.clone(), move |db| {
+            db.resolve_or_create_chat_id(
+                "telegram",
+                &external_chat_id_for_lookup,
+                chat_title_for_lookup.as_deref(),
+                &chat_type_for_lookup,
+            )
+        })
+        .await
+        {
+            Ok(chat_id) => chat_id,
+            Err(e) => {
+                error!(
+                    "Failed to resolve Telegram chat identity for external_chat_id={} raw_chat_id={}: {}",
+                    external_chat_id_for_log, raw_chat_id, e
+                );
+                send_response(
+                    &bot,
+                    reply_target.chat_id,
+                    reply_target.thread_id,
+                    "Internal routing error while resolving this Telegram chat/topic. Please retry.",
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    };
 
     // Extract content: text, photo, or voice
     let mut text = msg.text().unwrap_or("").to_string();
@@ -624,19 +856,6 @@ async fn handle_message(
 
     // Handle /reset command — clear session
     if text.trim() == "/reset" {
-        let external_chat_id = external_chat_id.clone();
-        let chat_title_for_lookup = chat_title.clone();
-        let chat_type_for_lookup = db_chat_type.to_string();
-        let chat_id = call_blocking(state.db.clone(), move |db| {
-            db.resolve_or_create_chat_id(
-                "telegram",
-                &external_chat_id,
-                chat_title_for_lookup.as_deref(),
-                &chat_type_for_lookup,
-            )
-        })
-        .await
-        .unwrap_or(raw_chat_id);
         if let Some(handle) = {
             let runs = state.chat_runs.lock().await;
             runs.get(&chat_id).cloned()
@@ -673,19 +892,6 @@ async fn handle_message(
 
     // Handle /archive command — archive current session to markdown
     if text.trim() == "/archive" {
-        let external_chat_id = external_chat_id.clone();
-        let chat_title_for_lookup = chat_title.clone();
-        let chat_type_for_lookup = db_chat_type.to_string();
-        let chat_id = call_blocking(state.db.clone(), move |db| {
-            db.resolve_or_create_chat_id(
-                "telegram",
-                &external_chat_id,
-                chat_title_for_lookup.as_deref(),
-                &chat_type_for_lookup,
-            )
-        })
-        .await
-        .unwrap_or(raw_chat_id);
         if let Ok(Some((json, _))) =
             call_blocking(state.db.clone(), move |db| db.load_session(chat_id)).await
         {
@@ -717,19 +923,6 @@ async fn handle_message(
 
     // Handle /usage command — token usage summary
     if text.trim() == "/usage" {
-        let external_chat_id = external_chat_id.clone();
-        let chat_title_for_lookup = chat_title.clone();
-        let chat_type_for_lookup = db_chat_type.to_string();
-        let chat_id = call_blocking(state.db.clone(), move |db| {
-            db.resolve_or_create_chat_id(
-                "telegram",
-                &external_chat_id,
-                chat_title_for_lookup.as_deref(),
-                &chat_type_for_lookup,
-            )
-        })
-        .await
-        .unwrap_or(raw_chat_id);
         match build_usage_report(state.db.clone(), &state.config, chat_id).await {
             Ok(response) => {
                 send_response(
@@ -910,19 +1103,6 @@ async fn handle_message(
         && !telegram_cfg.allowed_groups.is_empty()
         && !telegram_cfg.allowed_groups.contains(&raw_chat_id)
     {
-        let external_chat_id = external_chat_id.clone();
-        let chat_title_for_lookup = chat_title.clone();
-        let chat_type_for_lookup = db_chat_type.to_string();
-        let chat_id = call_blocking(state.db.clone(), move |db| {
-            db.resolve_or_create_chat_id(
-                "telegram",
-                &external_chat_id,
-                chat_title_for_lookup.as_deref(),
-                &chat_type_for_lookup,
-            )
-        })
-        .await
-        .unwrap_or(raw_chat_id);
         // Store message but don't process
         let chat_title_owned = chat_title.clone();
         let chat_type_owned = db_chat_type.to_string();
@@ -959,20 +1139,6 @@ async fn handle_message(
         let _ = call_blocking(state.db.clone(), move |db| db.store_message(&stored)).await;
         return Ok(());
     }
-
-    let external_chat_id = external_chat_id.clone();
-    let chat_title_for_lookup = chat_title.clone();
-    let chat_type_for_lookup = db_chat_type.to_string();
-    let chat_id = call_blocking(state.db.clone(), move |db| {
-        db.resolve_or_create_chat_id(
-            "telegram",
-            &external_chat_id,
-            chat_title_for_lookup.as_deref(),
-            &chat_type_for_lookup,
-        )
-    })
-    .await
-    .unwrap_or(raw_chat_id);
 
     // Store the chat and message
     let chat_title_owned = chat_title.clone();
@@ -1227,30 +1393,50 @@ async fn send_telegram_markdown_or_plain(
     chat_id: ChatId,
     thread_id: Option<ThreadId>,
     text: &str,
-) {
+) -> Option<MessageId> {
     let markdown_text = render_markdown_v2_safe(text);
     let mut req = bot.send_message(chat_id, markdown_text);
     if let Some(thread_id) = thread_id {
         req = req.message_thread_id(thread_id);
     }
-    let markdown = req.parse_mode(ParseMode::MarkdownV2).await;
-
-    if let Err(err) = markdown {
-        warn!("Telegram MarkdownV2 send failed, falling back to plain text: {err}");
-        let mut fallback_req = bot.send_message(chat_id, text);
-        if let Some(thread_id) = thread_id {
-            fallback_req = fallback_req.message_thread_id(thread_id);
-        }
-        if let Err(fallback_err) = fallback_req.await {
-            warn!("Telegram plain text fallback send failed: {fallback_err}");
+    match req.parse_mode(ParseMode::MarkdownV2).await {
+        Ok(message) => Some(message.id),
+        Err(err) => {
+            warn!("Telegram MarkdownV2 send failed, falling back to plain text: {err}");
+            let mut fallback_req = bot.send_message(chat_id, text);
+            if let Some(thread_id) = thread_id {
+                fallback_req = fallback_req.message_thread_id(thread_id);
+            }
+            match fallback_req.await {
+                Ok(message) => Some(message.id),
+                Err(fallback_err) => {
+                    warn!("Telegram plain text fallback send failed: {fallback_err}");
+                    None
+                }
+            }
         }
     }
 }
 
-pub async fn send_response(bot: &Bot, chat_id: ChatId, thread_id: Option<ThreadId>, text: &str) {
+async fn send_response_collect_message_ids(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+    text: &str,
+) -> Vec<MessageId> {
+    let mut ids = Vec::new();
     for chunk in split_response_text(text) {
-        send_telegram_markdown_or_plain(bot, chat_id, thread_id, &chunk).await;
+        if let Some(message_id) =
+            send_telegram_markdown_or_plain(bot, chat_id, thread_id, &chunk).await
+        {
+            ids.push(message_id);
+        }
     }
+    ids
+}
+
+pub async fn send_response(bot: &Bot, chat_id: ChatId, thread_id: Option<ThreadId>, text: &str) {
+    let _ = send_response_collect_message_ids(bot, chat_id, thread_id, text).await;
 }
 
 #[cfg(test)]
@@ -1900,6 +2086,88 @@ mod tests {
         let parent_chat = telegram_dispatch_key(-1001234567890, true, None);
 
         assert_eq!(general_topic, parent_chat);
+    }
+
+    #[test]
+    fn test_telegram_acp_status_text_active_session() {
+        let direct_mode = crate::acp::ChatDirectMode {
+            agent_id: "codex".to_string(),
+            workspace: "/tmp/project".to_string(),
+        };
+        let session = crate::acp::SessionSummary {
+            session_id: "sess-123".to_string(),
+            agent_id: "codex".to_string(),
+            workspace: "/tmp/project".to_string(),
+            status: crate::acp::SessionStatus::Prompting,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            idle_secs: 0,
+        };
+
+        let text = telegram_acp_status_text(&direct_mode, Some(&session));
+
+        assert!(text.contains("**ACP Mode**"));
+        assert!(text.contains("agent: codex"));
+        assert!(text.contains("workspace: /tmp/project"));
+        assert!(text.contains("status: prompting"));
+        assert!(text.contains("session: sess-123"));
+    }
+
+    #[test]
+    fn test_telegram_acp_status_text_waiting_for_resume() {
+        let direct_mode = crate::acp::ChatDirectMode {
+            agent_id: "codex".to_string(),
+            workspace: "/tmp/project".to_string(),
+        };
+
+        let text = telegram_acp_status_text(&direct_mode, None);
+
+        assert!(text.contains("**ACP Mode**"));
+        assert!(text.contains("agent: codex"));
+        assert!(text.contains("workspace: /tmp/project"));
+        assert!(text.contains("status: waiting_for_resume"));
+        assert!(text.contains("session: inactive"));
+    }
+
+    #[test]
+    fn test_edit_telegram_markdown_or_plain_treats_not_modified_as_success() {
+        let err = "Bad Request: message is not modified";
+        assert!(err.contains("message is not modified"));
+    }
+
+    #[test]
+    fn test_send_response_collect_message_ids_available() {
+        let text = "hello";
+        let chunks = split_response_text(text);
+        assert_eq!(chunks, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_render_markdown_v2_safe_preserves_acp_header() {
+        let rendered = render_markdown_v2_safe("**ACP Mode**\nstatus: waiting_for_resume");
+        assert!(rendered.contains("*ACP Mode*"));
+        assert!(rendered.contains("status: waiting\\_for\\_resume"));
+    }
+
+    #[test]
+    fn test_sync_pin_status_text_does_not_use_direct_session_for_waiting() {
+        let direct_mode = crate::acp::ChatDirectMode {
+            agent_id: "codex".to_string(),
+            workspace: "/tmp/project".to_string(),
+        };
+        let waiting = telegram_acp_status_text(&direct_mode, None);
+        let active = telegram_acp_status_text(
+            &direct_mode,
+            Some(&crate::acp::SessionSummary {
+                session_id: "sess-123".to_string(),
+                agent_id: "codex".to_string(),
+                workspace: "/tmp/project".to_string(),
+                status: crate::acp::SessionStatus::Active,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                idle_secs: 3,
+            }),
+        );
+
+        assert_ne!(waiting, active);
     }
 
     #[test]

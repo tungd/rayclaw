@@ -72,6 +72,8 @@ pub struct AppState {
     pub chat_locks: ChatLocks,
     /// Latest background run per chat_id. Channels can replace this to supersede stale work.
     pub chat_runs: ChatRuns,
+    /// Telegram-only ACP status pin message ids, keyed by internal chat_id/topic_id.
+    pub telegram_acp_status_pins: Mutex<HashMap<i64, i32>>,
     pub next_chat_run_id: AtomicU64,
 }
 
@@ -169,7 +171,7 @@ pub async fn create_app_state(
         tools.add_tool(tool);
     }
 
-    Ok(Arc::new(AppState {
+    let state = Arc::new(AppState {
         config,
         channel_registry,
         db,
@@ -181,8 +183,22 @@ pub async fn create_app_state(
         acp_manager,
         chat_locks: Mutex::new(HashMap::new()),
         chat_runs: Mutex::new(HashMap::new()),
+        telegram_acp_status_pins: Mutex::new(HashMap::new()),
         next_chat_run_id: AtomicU64::new(1),
-    }))
+    });
+
+    let state_for_acp_end = state.clone();
+    state
+        .acp_manager
+        .add_chat_session_end_callback(Arc::new(move |chat_id| {
+            let state = state_for_acp_end.clone();
+            Box::pin(async move {
+                crate::channels::telegram::sync_telegram_acp_status_pin(&state, chat_id).await;
+            })
+        }))
+        .await;
+
+    Ok(state)
 }
 
 pub async fn run(
