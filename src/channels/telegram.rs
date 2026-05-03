@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, ParseMode};
-use tracing::{error, info, warn};
+use teloxide::types::{ChatAction, InputFile, MessageId, ParseMode, ThreadId, Update, UpdateKind};
+use tracing::{debug, error, info, warn};
 
 use crate::agent_engine::{
     archive_conversation, process_with_agent_with_events, AgentEvent, AgentRequestContext,
@@ -27,6 +27,119 @@ pub struct TelegramChannelConfig {
     pub bot_username: String,
     #[serde(default)]
     pub allowed_groups: Vec<i64>,
+    #[serde(default = "default_telegram_respond_to_all_messages")]
+    pub respond_to_all_messages: bool,
+}
+
+fn default_telegram_respond_to_all_messages() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelegramTarget {
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+}
+
+fn telegram_conversation_thread_id(
+    is_topic_message: bool,
+    thread_id: Option<ThreadId>,
+) -> Option<ThreadId> {
+    if is_topic_message {
+        thread_id
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TelegramDispatchKey {
+    chat_id: i64,
+    conversation_thread_id: Option<i32>,
+}
+
+fn telegram_dispatch_key(
+    chat_id: i64,
+    is_topic_message: bool,
+    thread_id: Option<ThreadId>,
+) -> TelegramDispatchKey {
+    let conversation_thread_id = telegram_conversation_thread_id(is_topic_message, thread_id)
+        .map(|ThreadId(MessageId(thread_id))| thread_id);
+    TelegramDispatchKey {
+        chat_id,
+        conversation_thread_id,
+    }
+}
+
+fn telegram_update_dispatch_key(update: &Update) -> Option<TelegramDispatchKey> {
+    let message = match &update.kind {
+        UpdateKind::Message(message)
+        | UpdateKind::EditedMessage(message)
+        | UpdateKind::ChannelPost(message)
+        | UpdateKind::EditedChannelPost(message)
+        | UpdateKind::BusinessMessage(message)
+        | UpdateKind::EditedBusinessMessage(message) => message,
+        _ => return None,
+    };
+
+    Some(telegram_dispatch_key(
+        message.chat.id.0,
+        message.is_topic_message,
+        message.thread_id,
+    ))
+}
+
+fn format_telegram_external_chat_id(chat_id: i64, thread_id: Option<ThreadId>) -> String {
+    match thread_id {
+        Some(ThreadId(MessageId(thread_id))) => format!("{chat_id}:{thread_id}"),
+        None => chat_id.to_string(),
+    }
+}
+
+fn parse_telegram_external_chat_id(external_chat_id: &str) -> Result<TelegramTarget, String> {
+    let (chat_part, thread_part) = match external_chat_id.rsplit_once(':') {
+        Some((chat_part, thread_part)) if !thread_part.is_empty() => (chat_part, Some(thread_part)),
+        _ => (external_chat_id, None),
+    };
+
+    let chat_id = chat_part
+        .parse::<i64>()
+        .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+    let thread_id = match thread_part {
+        Some(thread_part) => {
+            let thread_id = thread_part
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid Telegram thread id in '{}'", external_chat_id))?;
+            Some(ThreadId(MessageId(thread_id)))
+        }
+        None => None,
+    };
+
+    Ok(TelegramTarget {
+        chat_id: ChatId(chat_id),
+        thread_id,
+    })
+}
+
+fn telegram_runtime_config(state: &AppState) -> TelegramChannelConfig {
+    state
+        .config
+        .channel_config::<TelegramChannelConfig>("telegram")
+        .unwrap_or_else(|| TelegramChannelConfig {
+            bot_token: state.config.telegram_bot_token.clone(),
+            bot_username: state.config.bot_username.clone(),
+            allowed_groups: state.config.allowed_groups.clone(),
+            respond_to_all_messages: false,
+        })
+}
+
+fn should_respond_in_telegram_group(text: &str, config: &TelegramChannelConfig) -> bool {
+    if config.respond_to_all_messages {
+        return true;
+    }
+
+    let bot_username = config.bot_username.trim().trim_start_matches('@');
+    !bot_username.is_empty() && text.contains(&format!("@{bot_username}"))
 }
 
 pub struct TelegramAdapter {
@@ -169,6 +282,7 @@ pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Resul
     let handler = Update::filter_message().endpoint(handle_message);
 
     Dispatcher::builder(bot, handler)
+        .distribution_function(telegram_update_dispatch_key)
         .default_handler(|_| async {})
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
@@ -1559,5 +1673,91 @@ mod tests {
     #[test]
     fn test_guess_image_media_type_empty() {
         assert_eq!(guess_image_media_type(&[]), "image/jpeg");
+    }
+
+    #[test]
+    fn test_format_and_parse_telegram_external_chat_id_without_thread() {
+        let external_chat_id = format_telegram_external_chat_id(-1001234567890, None);
+        assert_eq!(external_chat_id, "-1001234567890");
+
+        let target = parse_telegram_external_chat_id(&external_chat_id).unwrap();
+        assert_eq!(
+            target,
+            TelegramTarget {
+                chat_id: ChatId(-1001234567890),
+                thread_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_and_parse_telegram_external_chat_id_with_thread() {
+        let external_chat_id =
+            format_telegram_external_chat_id(-1001234567890, Some(ThreadId(MessageId(42))));
+        assert_eq!(external_chat_id, "-1001234567890:42");
+
+        let target = parse_telegram_external_chat_id(&external_chat_id).unwrap();
+        assert_eq!(
+            target,
+            TelegramTarget {
+                chat_id: ChatId(-1001234567890),
+                thread_id: Some(ThreadId(MessageId(42))),
+            }
+        );
+    }
+
+    #[test]
+    fn test_telegram_conversation_thread_id_keeps_regular_topic_thread() {
+        let thread_id = Some(ThreadId(MessageId(42)));
+        assert_eq!(telegram_conversation_thread_id(true, thread_id), thread_id);
+    }
+
+    #[test]
+    fn test_telegram_conversation_thread_id_ignores_general_topic_thread_for_chat_identity() {
+        let general_thread_id = Some(ThreadId(MessageId(1)));
+        assert_eq!(
+            telegram_conversation_thread_id(false, general_thread_id),
+            None
+        );
+    }
+
+    #[test]
+    fn test_telegram_dispatch_key_separates_topics_in_same_supergroup() {
+        let first = telegram_dispatch_key(-1001234567890, true, Some(ThreadId(MessageId(42))));
+        let second = telegram_dispatch_key(-1001234567890, true, Some(ThreadId(MessageId(43))));
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_telegram_dispatch_key_treats_general_topic_as_parent_chat() {
+        let general_topic =
+            telegram_dispatch_key(-1001234567890, false, Some(ThreadId(MessageId(1))));
+        let parent_chat = telegram_dispatch_key(-1001234567890, false, None);
+
+        assert_eq!(general_topic, parent_chat);
+    }
+
+    #[test]
+    fn test_should_respond_in_telegram_group_when_reply_all_enabled() {
+        let config = TelegramChannelConfig {
+            bot_token: "tok".into(),
+            bot_username: String::new(),
+            allowed_groups: vec![],
+            respond_to_all_messages: true,
+        };
+        assert!(should_respond_in_telegram_group("hello", &config));
+    }
+
+    #[test]
+    fn test_should_respond_in_telegram_group_when_mentioned() {
+        let config = TelegramChannelConfig {
+            bot_token: "tok".into(),
+            bot_username: "raybot".into(),
+            allowed_groups: vec![],
+            respond_to_all_messages: false,
+        };
+        assert!(should_respond_in_telegram_group("hi @raybot", &config));
+        assert!(!should_respond_in_telegram_group("hi there", &config));
     }
 }
