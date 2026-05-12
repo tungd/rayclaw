@@ -317,6 +317,7 @@ mod tests {
                 bot_token: "123456:TEST_TOKEN".into(),
                 bot_username: "bot".into(),
                 allowed_groups: vec![],
+                respond_to_all_messages: false,
             },
         );
         registry.register(Arc::new(tg_adapter));

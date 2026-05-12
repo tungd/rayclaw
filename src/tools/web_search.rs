@@ -37,6 +37,10 @@ impl Tool for WebSearchTool {
                     "query": {
                         "type": "string",
                         "description": "The search query"
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 8, max: 20)"
                     }
                 }),
                 &["query"],
@@ -50,7 +54,14 @@ impl Tool for WebSearchTool {
             None => return ToolResult::error("Missing required parameter: query".into()),
         };
 
-        match search_ddg(query).await {
+        let num_results = input
+            .get("num_results")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(8)
+            .min(20);
+
+        match search_ddg(query, num_results).await {
             Ok(results) => {
                 if results.is_empty() {
                     ToolResult::success("No results found.".into())
@@ -63,7 +74,7 @@ impl Tool for WebSearchTool {
     }
 }
 
-async fn search_ddg(query: &str) -> Result<String, String> {
+async fn search_ddg(query: &str, num_results: usize) -> Result<String, String> {
     let encoded = urlencoding::encode(query);
     let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
 
@@ -78,7 +89,7 @@ async fn search_ddg(query: &str) -> Result<String, String> {
     }
 
     let body = resp.text().await.map_err(|e| e.to_string())?;
-    let items = extract_ddg_results(&body, 8);
+    let items = extract_ddg_results(&body, num_results);
 
     let mut output = String::new();
     for (i, item) in items.iter().enumerate() {

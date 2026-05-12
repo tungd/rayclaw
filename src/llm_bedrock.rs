@@ -722,8 +722,12 @@ pub struct BedrockProvider {
 impl BedrockProvider {
     pub fn new(config: &Config) -> Result<Self, RayClawError> {
         let credentials = AwsCredentials::resolve(config)?;
+        let http = reqwest::Client::builder()
+            .user_agent("OpenAI/Go 3.22.0")
+            .build()
+            .expect("failed to build Bedrock HTTP client");
         Ok(BedrockProvider {
-            http: reqwest::Client::new(),
+            http,
             credentials,
             model: config.model.clone(),
             max_tokens: config.max_tokens,

@@ -28,7 +28,7 @@ fn default_max_tokens() -> u32 {
     8192
 }
 fn default_max_tool_iterations() -> usize {
-    100
+    20
 }
 fn default_max_loop_repeats() -> usize {
     3

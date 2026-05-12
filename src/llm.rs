@@ -255,8 +255,13 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(config: &Config) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent("OpenAI/Go 3.22.0")
+            .build()
+            .expect("failed to build Anthropic HTTP client");
+
         AnthropicProvider {
-            http: reqwest::Client::new(),
+            http,
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -900,8 +905,13 @@ impl OpenAiProvider {
             (config.api_key.clone(), None)
         };
 
+        let http = reqwest::Client::builder()
+            .user_agent("OpenAI/Go 3.22.0")
+            .build()
+            .expect("failed to build OpenAI-compatible HTTP client");
+
         OpenAiProvider {
-            http: reqwest::Client::new(),
+            http,
             api_key,
             codex_account_id,
             model: config.model.clone(),

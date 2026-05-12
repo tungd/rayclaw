@@ -212,11 +212,16 @@ pub async fn run(
 
     #[cfg(feature = "telegram")]
     if let Some(tg_cfg) = config.channel_config::<TelegramChannelConfig>("telegram") {
+        info!("Telegram config loaded: bot_token_len={} respond_to_all={}", 
+            tg_cfg.bot_token.len(), tg_cfg.respond_to_all_messages);
         if !tg_cfg.bot_token.trim().is_empty() {
             let bot = teloxide::Bot::new(&tg_cfg.bot_token);
             telegram_bot = Some(bot.clone());
             registry.register(Arc::new(TelegramAdapter::new(bot, tg_cfg)));
+            info!("Telegram adapter registered");
         }
+    } else {
+        tracing::warn!("Telegram config NOT found in channels map");
     }
 
     #[cfg(feature = "discord")]
@@ -368,6 +373,7 @@ pub async fn run(
 
     #[cfg(feature = "telegram")]
     if let Some(bot) = telegram_bot {
+        info!("Starting Telegram bot dispatcher...");
         let result = crate::telegram::start_telegram_bot(state.clone(), bot).await;
 
         // Clean up ACP sessions after Telegram dispatcher exits

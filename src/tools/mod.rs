@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod activate_skill;
+pub mod background;
 pub mod bash;
 pub mod browser;
 pub mod command_runner;
@@ -364,6 +365,7 @@ impl ToolRegistry {
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(todo::TodoReadTool::new(&config.data_dir)),
             Box::new(todo::TodoWriteTool::new(&config.data_dir)),
+            Box::new(background::BgTool::new()),
             Box::new(structured_memory::StructuredMemorySearchTool::new(
                 db.clone(),
             )),
@@ -436,6 +438,7 @@ impl ToolRegistry {
             Box::new(sync_skills::SyncSkillsTool::new(&skills_data_dir)),
             Box::new(todo::TodoReadTool::new(&config.data_dir)),
             Box::new(todo::TodoWriteTool::new(&config.data_dir)),
+            Box::new(background::BgTool::new()),
             Box::new(structured_memory::StructuredMemorySearchTool::new(
                 db.clone(),
             )),

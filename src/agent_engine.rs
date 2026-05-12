@@ -29,6 +29,8 @@ fn hash_tool_call(name: &str, input: &serde_json::Value) -> u64 {
 struct LoopDetector {
     /// Ring buffer of recent tool call hashes.
     history: Vec<u64>,
+    /// Parallel history of tool names for semantic loop detection.
+    name_history: Vec<String>,
     /// How many exact repetitions trigger detection.
     threshold: usize,
 }
@@ -37,6 +39,7 @@ impl LoopDetector {
     fn new(threshold: usize) -> Self {
         Self {
             history: Vec::new(),
+            name_history: Vec::new(),
             threshold: threshold.max(2), // minimum 2
         }
     }
@@ -45,7 +48,8 @@ impl LoopDetector {
     fn record(&mut self, name: &str, input: &serde_json::Value) -> bool {
         let hash = hash_tool_call(name, input);
         self.history.push(hash);
-        self.detect_exact_loop() || self.detect_same_tool_loop(name)
+        self.name_history.push(name.to_string());
+        self.detect_exact_loop() || self.detect_same_tool_loop()
     }
 
     /// Detect an exact repeating pattern of length 1..=history/2.
@@ -67,19 +71,18 @@ impl LoopDetector {
         false
     }
 
-    /// Detect the same tool name called too many times in the last N calls
-    /// (even if params differ slightly). Uses the last `threshold * 2` entries.
-    fn detect_same_tool_loop(&self, latest_name: &str) -> bool {
-        // We only track hashes, so we need the name history too.
-        // Instead, we'll count consecutive same-name calls at the tail.
-        // This is a lighter check — if the last `threshold + 2` calls are all
-        // the same tool name, it's likely a semantic loop.
-        // We can't check name from hash alone, but since this is called right
-        // after record() with the name, we store names separately.
-        // For simplicity, this method is a no-op here — the exact_loop catches
-        // the critical cases. Full semantic detection can be added later.
-        let _ = latest_name;
-        false
+    /// Detect the same tool name called too many times consecutively
+    /// (even if params differ). Triggers when the same tool is called
+    /// `threshold * 2` times in a row.
+    fn detect_same_tool_loop(&self) -> bool {
+        let len = self.name_history.len();
+        let required = self.threshold * 2;
+        if len < required {
+            return false;
+        }
+        let tail = &self.name_history[len - required..];
+        let first = &tail[0];
+        tail.iter().all(|n| n == first)
     }
 }
 
@@ -2674,9 +2677,46 @@ mod tests {
     fn test_loop_detector_different_params_no_loop() {
         let mut det = super::LoopDetector::new(3);
         // Same tool but different params — not an exact loop
+        // (same-tool-name detection requires threshold*2 = 6 consecutive calls)
         assert!(!det.record("read_file", &serde_json::json!({"path": "a"})));
         assert!(!det.record("read_file", &serde_json::json!({"path": "b"})));
         assert!(!det.record("read_file", &serde_json::json!({"path": "c"})));
+    }
+
+    #[test]
+    fn test_loop_detector_same_tool_name_loop() {
+        // Same tool name with different params — triggers after threshold*2 consecutive calls
+        let mut det = super::LoopDetector::new(3);
+        // 5 calls — not yet enough (need 6 = 3*2)
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url1"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url2"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url3"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url4"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url5"})));
+        // 6th consecutive bash call → same-tool loop detected
+        assert!(det.record("bash", &serde_json::json!({"command": "curl url6"})));
+    }
+
+    #[test]
+    fn test_loop_detector_same_tool_name_reset_by_other() {
+        // Same tool name interrupted by a different tool resets the counter
+        let mut det = super::LoopDetector::new(3);
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url1"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url2"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url3"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url4"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url5"})));
+        // Different tool breaks the streak
+        assert!(!det.record("web_fetch", &serde_json::json!({"url": "http://example.com"})));
+        // Need 6 more consecutive bash calls after web_fetch to trigger
+        // (web_fetch is still in the window, so first 5 don't trigger)
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url6"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url7"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url8"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url9"})));
+        assert!(!det.record("bash", &serde_json::json!({"command": "curl url10"})));
+        // 6th consecutive bash after web_fetch leaves window → loop detected
+        assert!(det.record("bash", &serde_json::json!({"command": "curl url11"})));
     }
 
     #[test]

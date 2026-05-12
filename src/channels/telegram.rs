@@ -279,8 +279,15 @@ fn format_user_message(sender_name: &str, content: &str) -> String {
 }
 
 pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Result<()> {
+    info!("Telegram bot: testing connection...");
+    match bot.get_me().send().await {
+        Ok(me) => info!("Telegram bot connected as: @{}", me.username.as_deref().unwrap_or("unknown")),
+        Err(e) => error!("Telegram bot get_me failed: {}", e),
+    }
+
     let handler = Update::filter_message().endpoint(handle_message);
 
+    info!("Telegram bot: starting dispatcher with long polling...");
     Dispatcher::builder(bot, handler)
         .distribution_function(telegram_update_dispatch_key)
         .default_handler(|_| async {})
@@ -290,6 +297,7 @@ pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Resul
         .dispatch()
         .await;
 
+    info!("Telegram bot: dispatcher exited");
     Ok(())
 }
 async fn handle_message(
@@ -297,6 +305,13 @@ async fn handle_message(
     msg: teloxide::types::Message,
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    debug!(
+        "Telegram handle_message: chat_id={} chat_type={:?} from={} text={}",
+        msg.chat.id.0,
+        msg.chat.kind,
+        msg.from.as_ref().map(|u| u.username.as_deref().unwrap_or(&u.first_name)).unwrap_or("unknown"),
+        msg.text().unwrap_or("").chars().take(100).collect::<String>(),
+    );
     let raw_chat_id = msg.chat.id.0;
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
@@ -686,12 +701,10 @@ async fn handle_message(
     let _ = call_blocking(state.db.clone(), move |db| db.store_message(&stored)).await;
 
     // Determine if we should respond
+    let tg_config = telegram_runtime_config(&state);
     let should_respond = match runtime_chat_type {
         "private" => true,
-        _ => {
-            let bot_mention = format!("@{}", state.config.bot_username);
-            text.contains(&bot_mention)
-        }
+        _ => should_respond_in_telegram_group(&text, &tg_config),
     };
 
     if !should_respond {
