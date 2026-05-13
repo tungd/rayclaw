@@ -61,6 +61,20 @@ fn default_timeout_secs() -> u64 {
     600
 }
 
+fn extract_first_url(text: &str) -> Option<String> {
+    let start = text.find("https://").or_else(|| text.find("http://"))?;
+    let candidate = text[start..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | '}' | '>' | ',' | '.'));
+
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Browser session (spawned subprocess)
 // ---------------------------------------------------------------------------
@@ -450,7 +464,12 @@ impl Tool for BrowserSubagentTool {
             return ToolResult::error("Missing 'task' parameter".to_string());
         }
 
-        let url = input.get("url").and_then(|v| v.as_str());
+        let url = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| extract_first_url(task));
         let timeout_secs = input
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -466,16 +485,14 @@ impl Tool for BrowserSubagentTool {
         };
 
         // Navigate if URL provided
-        if let Some(url) = url {
-            if !url.is_empty() {
-                match session.navigate(url).await {
-                    Ok(result) => {
-                        if result.error.is_some() {
-                            return result.to_tool_result();
-                        }
+        if let Some(url) = url.as_deref() {
+            match session.navigate(url).await {
+                Ok(result) => {
+                    if result.error.is_some() {
+                        return result.to_tool_result();
                     }
-                    Err(e) => return ToolResult::error(format!("Navigation failed: {e}")),
                 }
+                Err(e) => return ToolResult::error(format!("Navigation failed: {e}")),
             }
         }
 
@@ -517,5 +534,18 @@ mod tests {
         assert!(definition.description.contains("rayclaw-browser"));
         assert!(definition.input_schema["properties"]["task"].is_object());
         assert!(definition.input_schema["properties"]["url"].is_object());
+    }
+
+    #[test]
+    fn test_extract_first_url_from_task() {
+        assert_eq!(
+            extract_first_url("Navigate to https://example.com/path, then summarize."),
+            Some("https://example.com/path".to_string())
+        );
+        assert_eq!(
+            extract_first_url("Open (http://localhost:3000/foo)."),
+            Some("http://localhost:3000/foo".to_string())
+        );
+        assert_eq!(extract_first_url("no url here"), None);
     }
 }
