@@ -43,7 +43,7 @@ Rust 2021 edition. Tokio async runtime. teloxide 0.17 (Telegram), serenity 0.12 
 | `src/tools/structured_memory.rs` | SQLite-backed structured memory |
 | `src/tools/web_search.rs` | DuckDuckGo search |
 | `src/tools/web_fetch.rs` | URL fetching with HTML→text |
-| `src/tools/browser.rs` | Headless browser (agent-browser wrapper) |
+| `src/tools/browser_subagent.rs` | RayClaw Browser wrapper (`rayclaw-browser`) |
 | `src/tools/send_message.rs` | Mid-conversation messaging (all channels) |
 | `src/tools/schedule.rs` | 5 scheduling tools |
 | `src/tools/sub_agent.rs` | Sub-agent with restricted tool set |

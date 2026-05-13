@@ -325,29 +325,25 @@ fn check_node_and_browser(report: &mut DoctorReport) {
         },
     );
 
-    let browser_cmd = if cfg!(target_os = "windows") {
-        command_exists("agent-browser.cmd") || command_exists("agent-browser")
-    } else {
-        command_exists("agent-browser")
-    };
+    let browser_cmd = command_exists("rayclaw-browser");
 
     report.push(
-        "deps.agent_browser",
-        "agent-browser",
+        "deps.rayclaw_browser",
+        "rayclaw-browser",
         if browser_cmd {
             CheckStatus::Pass
         } else {
             CheckStatus::Warn
         },
         if browser_cmd {
-            "agent-browser command found".to_string()
+            "rayclaw-browser command found".to_string()
         } else {
-            "agent-browser command not found".to_string()
+            "rayclaw-browser command not found".to_string()
         },
         if browser_cmd {
             None
         } else {
-            Some("Run `npm install -g agent-browser && agent-browser install`.".to_string())
+            Some("Install RayClaw Browser as `rayclaw-browser` on PATH.".to_string())
         },
     );
 }

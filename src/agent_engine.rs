@@ -27,63 +27,53 @@ fn hash_tool_call(name: &str, input: &serde_json::Value) -> u64 {
 }
 
 struct LoopDetector {
-    /// Ring buffer of recent tool call hashes.
-    history: Vec<u64>,
-    /// Parallel history of tool names for semantic loop detection.
-    name_history: Vec<String>,
-    /// How many exact repetitions trigger detection.
+    /// Hash of each iteration's tool-call set (combined, order-independent).
+    iteration_history: Vec<u64>,
+    /// How many identical iterations trigger detection.
     threshold: usize,
 }
 
 impl LoopDetector {
     fn new(threshold: usize) -> Self {
         Self {
-            history: Vec::new(),
-            name_history: Vec::new(),
-            threshold: threshold.max(2), // minimum 2
+            iteration_history: Vec::new(),
+            threshold: threshold.max(2),
         }
     }
 
-    /// Record a tool call. Returns `true` if a loop is detected.
-    fn record(&mut self, name: &str, input: &serde_json::Value) -> bool {
-        let hash = hash_tool_call(name, input);
-        self.history.push(hash);
-        self.name_history.push(name.to_string());
-        self.detect_exact_loop() || self.detect_same_tool_loop()
+    /// Record all tool calls for one iteration. Returns `true` if a loop is detected.
+    fn record_iteration(&mut self, calls: &[(&str, &serde_json::Value)]) -> bool {
+        let iter_hash = hash_tool_call_set(calls);
+        self.iteration_history.push(iter_hash);
+        self.detect_loop()
     }
 
-    /// Detect an exact repeating pattern of length 1..=history/2.
-    /// E.g. [A, B, A, B, A, B] with threshold=3 → detected (pattern [A,B] repeats 3 times).
-    fn detect_exact_loop(&self) -> bool {
-        let len = self.history.len();
-        // Try pattern lengths from 1 up to half the history
-        for pattern_len in 1..=(len / 2) {
-            if len < pattern_len * self.threshold {
-                continue;
-            }
-            let tail = &self.history[len - pattern_len * self.threshold..];
-            let pattern = &tail[..pattern_len];
-            let all_match = tail.chunks(pattern_len).all(|chunk| chunk == pattern);
-            if all_match {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Detect the same tool name called too many times consecutively
-    /// (even if params differ). Triggers when the same tool is called
-    /// `threshold * 2` times in a row.
-    fn detect_same_tool_loop(&self) -> bool {
-        let len = self.name_history.len();
-        let required = self.threshold * 2;
-        if len < required {
+    /// Detect when the same iteration pattern repeats `threshold` times in a row.
+    fn detect_loop(&self) -> bool {
+        let len = self.iteration_history.len();
+        if len < self.threshold {
             return false;
         }
-        let tail = &self.name_history[len - required..];
-        let first = &tail[0];
-        tail.iter().all(|n| n == first)
+        let tail = &self.iteration_history[len - self.threshold..];
+        let first = tail[0];
+        tail.iter().all(|&h| h == first)
     }
+}
+
+/// Hash a set of tool calls for one iteration (order-independent via sorted hashes).
+fn hash_tool_call_set(calls: &[(&str, &serde_json::Value)]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hashes: Vec<u64> = calls
+        .iter()
+        .map(|(name, input)| hash_tool_call(name, input))
+        .collect();
+    hashes.sort();
+    let mut hasher = DefaultHasher::new();
+    for h in &hashes {
+        h.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1215,15 +1205,19 @@ pub(crate) async fn process_with_agent_impl(
                 }
             }
 
-            // Record tool calls in the loop detector
-            let mut loop_detected = false;
-            for block in &response.content {
-                if let ResponseContentBlock::ToolUse { name, input, .. } = block {
-                    if loop_detector.record(name, input) {
-                        loop_detected = true;
+            // Record tool calls in the loop detector (per-iteration batch)
+            let tool_calls_in_iteration: Vec<(&str, &serde_json::Value)> = response
+                .content
+                .iter()
+                .filter_map(|block| {
+                    if let ResponseContentBlock::ToolUse { name, input, .. } = block {
+                        Some((name.as_str(), input))
+                    } else {
+                        None
                     }
-                }
-            }
+                })
+                .collect();
+            let loop_detected = loop_detector.record_iteration(&tool_calls_in_iteration);
 
             if loop_detected {
                 session_metrics.loop_detected = true;
@@ -2645,97 +2639,97 @@ mod tests {
     #[test]
     fn test_loop_detector_no_loop() {
         let mut det = super::LoopDetector::new(3);
-        // Different tool calls — no loop
-        assert!(!det.record("read_file", &serde_json::json!({"path": "a.rs"})));
-        assert!(!det.record("write_file", &serde_json::json!({"path": "b.rs"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "ls"})));
+        // Different iterations — no loop
+        assert!(!det.record_iteration(&[("read_file", &serde_json::json!({"path": "a.rs"}))]));
+        assert!(!det.record_iteration(&[("write_file", &serde_json::json!({"path": "b.rs"}))]));
+        assert!(!det.record_iteration(&[("bash", &serde_json::json!({"command": "ls"}))]));
     }
 
     #[test]
-    fn test_loop_detector_exact_single_repeat() {
+    fn test_loop_detector_same_iteration_repeat() {
         let mut det = super::LoopDetector::new(3);
-        let input = serde_json::json!({"path": "/tmp/x"});
-        assert!(!det.record("read_file", &input)); // 1st
-        assert!(!det.record("read_file", &input)); // 2nd
-        assert!(det.record("read_file", &input)); // 3rd → loop!
-    }
-
-    #[test]
-    fn test_loop_detector_pattern_ab_repeat() {
-        let mut det = super::LoopDetector::new(3);
-        let a = serde_json::json!({"path": "a"});
-        let b = serde_json::json!({"path": "b"});
-        assert!(!det.record("read_file", &a)); // A
-        assert!(!det.record("write_file", &b)); // B
-        assert!(!det.record("read_file", &a)); // A
-        assert!(!det.record("write_file", &b)); // B
-        assert!(!det.record("read_file", &a)); // A
-        assert!(det.record("write_file", &b)); // B → pattern [A,B] × 3 detected
+        let iter = [("read_file", &serde_json::json!({"path": "/tmp/x"}))];
+        assert!(!det.record_iteration(&iter)); // 1st
+        assert!(!det.record_iteration(&iter)); // 2nd
+        assert!(det.record_iteration(&iter)); // 3rd → loop!
     }
 
     #[test]
     fn test_loop_detector_different_params_no_loop() {
         let mut det = super::LoopDetector::new(3);
-        // Same tool but different params — not an exact loop
-        // (same-tool-name detection requires threshold*2 = 6 consecutive calls)
-        assert!(!det.record("read_file", &serde_json::json!({"path": "a"})));
-        assert!(!det.record("read_file", &serde_json::json!({"path": "b"})));
-        assert!(!det.record("read_file", &serde_json::json!({"path": "c"})));
+        // Same tool but different params across iterations — no loop
+        assert!(!det.record_iteration(&[("read_file", &serde_json::json!({"path": "a"}))]));
+        assert!(!det.record_iteration(&[("read_file", &serde_json::json!({"path": "b"}))]));
+        assert!(!det.record_iteration(&[("read_file", &serde_json::json!({"path": "c"}))]));
     }
 
     #[test]
-    fn test_loop_detector_same_tool_name_loop() {
-        // Same tool name with different params — triggers after threshold*2 consecutive calls
+    fn test_loop_detector_parallel_calls_same_each_iteration() {
+        // Each iteration has 3 parallel read_file calls with different paths
+        // All iterations are identical → loop detected
         let mut det = super::LoopDetector::new(3);
-        // 5 calls — not yet enough (need 6 = 3*2)
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url1"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url2"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url3"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url4"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url5"})));
-        // 6th consecutive bash call → same-tool loop detected
-        assert!(det.record("bash", &serde_json::json!({"command": "curl url6"})));
+        let iter = &[
+            ("read_file", &serde_json::json!({"path": "a"})),
+            ("read_file", &serde_json::json!({"path": "b"})),
+            ("read_file", &serde_json::json!({"path": "c"})),
+        ];
+        assert!(!det.record_iteration(iter));
+        assert!(!det.record_iteration(iter));
+        assert!(det.record_iteration(iter)); // 3rd identical iteration → loop
     }
 
     #[test]
-    fn test_loop_detector_same_tool_name_reset_by_other() {
-        // Same tool name interrupted by a different tool resets the counter
+    fn test_loop_detector_parallel_calls_different_each_iteration() {
+        // Each iteration has 3 parallel read_file calls but with different paths
+        // Iterations differ → no loop
         let mut det = super::LoopDetector::new(3);
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url1"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url2"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url3"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url4"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url5"})));
-        // Different tool breaks the streak
-        assert!(!det.record("web_fetch", &serde_json::json!({"url": "http://example.com"})));
-        // Need 6 more consecutive bash calls after web_fetch to trigger
-        // (web_fetch is still in the window, so first 5 don't trigger)
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url6"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url7"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url8"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url9"})));
-        assert!(!det.record("bash", &serde_json::json!({"command": "curl url10"})));
-        // 6th consecutive bash after web_fetch leaves window → loop detected
-        assert!(det.record("bash", &serde_json::json!({"command": "curl url11"})));
+        assert!(!det.record_iteration(&[
+            ("read_file", &serde_json::json!({"path": "a1"})),
+            ("read_file", &serde_json::json!({"path": "b1"})),
+            ("read_file", &serde_json::json!({"path": "c1"})),
+        ]));
+        assert!(!det.record_iteration(&[
+            ("read_file", &serde_json::json!({"path": "a2"})),
+            ("read_file", &serde_json::json!({"path": "b2"})),
+            ("read_file", &serde_json::json!({"path": "c2"})),
+        ]));
+        assert!(!det.record_iteration(&[
+            ("read_file", &serde_json::json!({"path": "a3"})),
+            ("read_file", &serde_json::json!({"path": "b3"})),
+            ("read_file", &serde_json::json!({"path": "c3"})),
+        ]));
     }
 
     #[test]
     fn test_loop_detector_threshold_4() {
         let mut det = super::LoopDetector::new(4);
-        let input = serde_json::json!({"x": 1});
-        assert!(!det.record("tool", &input)); // 1
-        assert!(!det.record("tool", &input)); // 2
-        assert!(!det.record("tool", &input)); // 3
-        assert!(det.record("tool", &input)); // 4 → loop with threshold=4
+        let iter = [("tool", &serde_json::json!({"x": 1}))];
+        assert!(!det.record_iteration(&iter)); // 1
+        assert!(!det.record_iteration(&iter)); // 2
+        assert!(!det.record_iteration(&iter)); // 3
+        assert!(det.record_iteration(&iter)); // 4 → loop with threshold=4
     }
 
     #[test]
     fn test_loop_detector_minimum_threshold() {
         // Threshold 1 is clamped to 2
         let mut det = super::LoopDetector::new(1);
-        let input = serde_json::json!({});
-        assert!(!det.record("tool", &input)); // 1
-        assert!(det.record("tool", &input)); // 2 → loop (min threshold=2)
+        let iter = [("tool", &serde_json::json!({}))];
+        assert!(!det.record_iteration(&iter)); // 1
+        assert!(det.record_iteration(&iter)); // 2 → loop (min threshold=2)
+    }
+
+    #[test]
+    fn test_hash_tool_call_set_order_independent() {
+        let a = super::hash_tool_call_set(&[
+            ("read_file", &serde_json::json!({"path": "x"})),
+            ("bash", &serde_json::json!({"command": "ls"})),
+        ]);
+        let b = super::hash_tool_call_set(&[
+            ("bash", &serde_json::json!({"command": "ls"})),
+            ("read_file", &serde_json::json!({"path": "x"})),
+        ]);
+        assert_eq!(a, b); // order shouldn't matter
     }
 
     #[test]

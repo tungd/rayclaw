@@ -2,7 +2,7 @@ pub mod acp;
 pub mod activate_skill;
 pub mod background;
 pub mod bash;
-pub mod browser;
+pub mod browser_subagent;
 pub mod command_runner;
 pub mod edit_file;
 pub mod export_chat;
@@ -301,7 +301,7 @@ impl ToolRegistry {
                 &config.working_dir,
                 config.working_dir_isolation,
             )),
-            Box::new(browser::BrowserTool::new(&config.data_dir)),
+            Box::new(browser_subagent::BrowserSubagentTool::new()),
             Box::new(read_file::ReadFileTool::new_with_isolation(
                 &config.working_dir,
                 config.working_dir_isolation,
@@ -404,7 +404,7 @@ impl ToolRegistry {
                 &config.working_dir,
                 config.working_dir_isolation,
             )),
-            Box::new(browser::BrowserTool::new(&config.data_dir)),
+            Box::new(browser_subagent::BrowserSubagentTool::new()),
             Box::new(read_file::ReadFileTool::new_with_isolation(
                 &config.working_dir,
                 config.working_dir_isolation,
@@ -475,7 +475,7 @@ impl ToolRegistry {
                 &config.working_dir,
                 config.working_dir_isolation,
             )),
-            Box::new(browser::BrowserTool::new(&config.data_dir)),
+            Box::new(browser_subagent::BrowserSubagentTool::new()),
             Box::new(read_file::ReadFileTool::new_with_isolation(
                 &config.working_dir,
                 config.working_dir_isolation,

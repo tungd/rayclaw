@@ -146,7 +146,7 @@ rayclaw doctor
 rayclaw doctor --json
 ```
 
-会检查：PATH、shell 运行时、Node/npm、`agent-browser`、以及 `rayclaw.data/mcp.json` 里的 MCP 命令依赖。
+会检查：PATH、shell 运行时、Node/npm、`rayclaw-browser`、以及 `rayclaw.data/mcp.json` 里的 MCP 命令依赖。
 
 ### 卸载（脚本）
 
@@ -821,7 +821,7 @@ src/
         structured_memory.rs # SQLite 结构化记忆
         web_search.rs    # DuckDuckGo 搜索
         web_fetch.rs     # URL 抓取（HTML→纯文本）
-        browser.rs       # 无头浏览器（agent-browser 封装）
+        browser_subagent.rs # RayClaw Browser（WKWebView 子代理）
         send_message.rs  # 会话中发消息（所有渠道）
         schedule.rs      # 5 个调度工具
         sub_agent.rs     # 有限制工具集的子代理

@@ -209,10 +209,8 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
-        send_response(&self.bot, ChatId(telegram_chat_id), text).await;
+        let target = parse_telegram_external_chat_id(external_chat_id)?;
+        send_response_to_topic(&self.bot, target, text).await;
         Ok(())
     }
 
@@ -222,16 +220,17 @@ impl ChannelAdapter for TelegramAdapter {
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<String, String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+        let target = parse_telegram_external_chat_id(external_chat_id)?;
 
         let (caption_for_attachment, overflow_text) = Self::split_telegram_caption(caption);
 
         if Self::is_likely_image(file_path) {
             let mut req = self
                 .bot
-                .send_photo(ChatId(telegram_chat_id), InputFile::file(file_path));
+                .send_photo(target.chat_id, InputFile::file(file_path));
+            if let Some(tid) = target.thread_id {
+                req = req.message_thread_id(tid);
+            }
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
@@ -240,7 +239,10 @@ impl ChannelAdapter for TelegramAdapter {
         } else {
             let mut req = self
                 .bot
-                .send_document(ChatId(telegram_chat_id), InputFile::file(file_path));
+                .send_document(target.chat_id, InputFile::file(file_path));
+            if let Some(tid) = target.thread_id {
+                req = req.message_thread_id(tid);
+            }
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
@@ -249,7 +251,7 @@ impl ChannelAdapter for TelegramAdapter {
         }
 
         if let Some(extra) = overflow_text {
-            send_response(&self.bot, ChatId(telegram_chat_id), &extra).await;
+            send_response_to_topic(&self.bot, target, &extra).await;
         }
 
         Ok(match caption {
@@ -281,7 +283,10 @@ fn format_user_message(sender_name: &str, content: &str) -> String {
 pub async fn start_telegram_bot(state: Arc<AppState>, bot: Bot) -> anyhow::Result<()> {
     info!("Telegram bot: testing connection...");
     match bot.get_me().send().await {
-        Ok(me) => info!("Telegram bot connected as: @{}", me.username.as_deref().unwrap_or("unknown")),
+        Ok(me) => info!(
+            "Telegram bot connected as: @{}",
+            me.username.as_deref().unwrap_or("unknown")
+        ),
         Err(e) => error!("Telegram bot get_me failed: {}", e),
     }
 
@@ -309,10 +314,23 @@ async fn handle_message(
         "Telegram handle_message: chat_id={} chat_type={:?} from={} text={}",
         msg.chat.id.0,
         msg.chat.kind,
-        msg.from.as_ref().map(|u| u.username.as_deref().unwrap_or(&u.first_name)).unwrap_or("unknown"),
-        msg.text().unwrap_or("").chars().take(100).collect::<String>(),
+        msg.from
+            .as_ref()
+            .map(|u| u.username.as_deref().unwrap_or(&u.first_name))
+            .unwrap_or("unknown"),
+        msg.text()
+            .unwrap_or("")
+            .chars()
+            .take(100)
+            .collect::<String>(),
     );
     let raw_chat_id = msg.chat.id.0;
+    let conversation_thread_id =
+        telegram_conversation_thread_id(msg.is_topic_message, msg.thread_id);
+    let response_target = TelegramTarget {
+        chat_id: msg.chat.id,
+        thread_id: msg.thread_id,
+    };
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
         teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
@@ -337,7 +355,8 @@ async fn handle_message(
 
     // Handle /reset command — clear session
     if text.trim() == "/reset" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id =
+            format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -351,22 +370,26 @@ async fn handle_message(
         .await
         .unwrap_or(raw_chat_id);
         let _ = call_blocking(state.db.clone(), move |db| db.clear_chat_context(chat_id)).await;
-        let _ = bot
-            .send_message(msg.chat.id, "Context cleared (session + chat history).")
-            .await;
+        send_to_target(
+            &bot,
+            response_target,
+            "Context cleared (session + chat history).",
+        )
+        .await;
         return Ok(());
     }
 
     // Handle /skills command — list available skills
     if text.trim() == "/skills" {
         let formatted = state.skills.list_skills_formatted();
-        let _ = bot.send_message(msg.chat.id, formatted).await;
+        send_to_target(&bot, response_target, formatted).await;
         return Ok(());
     }
 
     // Handle /archive command — archive current session to markdown
     if text.trim() == "/archive" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id =
+            format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -384,29 +407,26 @@ async fn handle_message(
         {
             let messages: Vec<Message> = serde_json::from_str(&json).unwrap_or_default();
             if messages.is_empty() {
-                let _ = bot
-                    .send_message(msg.chat.id, "No session to archive.")
-                    .await;
+                send_to_target(&bot, response_target, "No session to archive.").await;
             } else {
                 archive_conversation(&state.config.data_dir, "telegram", chat_id, &messages);
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Archived {} messages.", messages.len()),
-                    )
-                    .await;
+                send_to_target(
+                    &bot,
+                    response_target,
+                    format!("Archived {} messages.", messages.len()),
+                )
+                .await;
             }
         } else {
-            let _ = bot
-                .send_message(msg.chat.id, "No session to archive.")
-                .await;
+            send_to_target(&bot, response_target, "No session to archive.").await;
         }
         return Ok(());
     }
 
     // Handle /usage command — token usage summary
     if text.trim() == "/usage" {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id =
+            format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -421,15 +441,15 @@ async fn handle_message(
         .unwrap_or(raw_chat_id);
         match build_usage_report(state.db.clone(), &state.config, chat_id).await {
             Ok(response) => {
-                let _ = bot.send_message(msg.chat.id, response).await;
+                send_to_target(&bot, response_target, response).await;
             }
             Err(e) => {
-                let _ = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("Failed to query usage statistics: {e}"),
-                    )
-                    .await;
+                send_to_target(
+                    &bot,
+                    response_target,
+                    format!("Failed to query usage statistics: {e}"),
+                )
+                .await;
             }
         }
         return Ok(());
@@ -600,7 +620,8 @@ async fn handle_message(
         && !state.config.allowed_groups.is_empty()
         && !state.config.allowed_groups.contains(&raw_chat_id)
     {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id =
+            format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -650,7 +671,7 @@ async fn handle_message(
         return Ok(());
     }
 
-    let external_chat_id = raw_chat_id.to_string();
+    let external_chat_id = format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
     let chat_title_for_lookup = chat_title.clone();
     let chat_type_for_lookup = db_chat_type.to_string();
     let chat_id = call_blocking(state.db.clone(), move |db| {
@@ -758,7 +779,7 @@ async fn handle_message(
             }
 
             if !response.is_empty() {
-                send_response(&bot, msg.chat.id, &response).await;
+                send_response_to_topic(&bot, response_target, &response).await;
 
                 // Store bot response
                 let bot_msg = StoredMessage {
@@ -779,7 +800,7 @@ async fn handle_message(
                 );
             } else {
                 let fallback = "I couldn't produce a visible reply after an automatic retry. Please try again.".to_string();
-                send_response(&bot, msg.chat.id, &fallback).await;
+                send_response_to_topic(&bot, response_target, &fallback).await;
                 let bot_msg = StoredMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     chat_id,
@@ -794,7 +815,7 @@ async fn handle_message(
         Err(e) => {
             typing_handle.abort();
             error!("Error processing message: {}", e);
-            let _ = bot.send_message(msg.chat.id, format!("Error: {e}")).await;
+            send_to_target(&bot, response_target, format!("Error: {e}")).await;
         }
     }
 
@@ -983,23 +1004,52 @@ fn render_markdown_v2_safe(text: &str) -> String {
     out
 }
 
-async fn send_telegram_markdown_or_plain(bot: &Bot, chat_id: ChatId, text: &str) {
+async fn send_telegram_markdown_or_plain(
+    bot: &Bot,
+    chat_id: ChatId,
+    thread_id: Option<ThreadId>,
+    text: &str,
+) {
     let markdown_text = render_markdown_v2_safe(text);
-    let markdown = bot
+    let mut req = bot
         .send_message(chat_id, markdown_text)
-        .parse_mode(ParseMode::MarkdownV2)
-        .await;
+        .parse_mode(ParseMode::MarkdownV2);
+    if let Some(tid) = thread_id {
+        req = req.message_thread_id(tid);
+    }
+    let markdown = req.await;
 
     if let Err(err) = markdown {
         warn!("Telegram MarkdownV2 send failed, falling back to plain text: {err}");
-        let _ = bot.send_message(chat_id, text).await;
+        let mut req = bot.send_message(chat_id, text);
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+        let _ = req.await;
     }
 }
 
 pub async fn send_response(bot: &Bot, chat_id: ChatId, text: &str) {
     for chunk in split_response_text(text) {
-        send_telegram_markdown_or_plain(bot, chat_id, &chunk).await;
+        send_telegram_markdown_or_plain(bot, chat_id, None, &chunk).await;
     }
+}
+
+/// Send response to a specific Telegram topic (thread) in a supergroup.
+async fn send_response_to_topic(bot: &Bot, target: TelegramTarget, text: &str) {
+    for chunk in split_response_text(text) {
+        send_telegram_markdown_or_plain(bot, target.chat_id, target.thread_id, &chunk).await;
+    }
+}
+
+/// Send a simple text message to a Telegram target (chat + optional thread).
+async fn send_to_target(bot: &Bot, target: TelegramTarget, text: impl Into<String>) {
+    let text = text.into();
+    let mut req = bot.send_message(target.chat_id, text);
+    if let Some(tid) = target.thread_id {
+        req = req.message_thread_id(tid);
+    }
+    let _ = req.await;
 }
 
 #[cfg(test)]

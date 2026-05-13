@@ -28,14 +28,6 @@ pub fn shell_command(command: &str) -> CommandSpec {
     }
 }
 
-pub fn agent_browser_program() -> String {
-    if cfg!(target_os = "windows") {
-        "agent-browser.cmd".to_string()
-    } else {
-        "agent-browser".to_string()
-    }
-}
-
 pub fn build_command(spec: &CommandSpec, working_dir: Option<&Path>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args);
@@ -54,11 +46,5 @@ mod tests {
         let spec = shell_command("echo hello");
         assert!(!spec.program.is_empty());
         assert!(!spec.args.is_empty());
-    }
-
-    #[test]
-    fn test_agent_browser_program_not_empty() {
-        let p = agent_browser_program();
-        assert!(!p.trim().is_empty());
     }
 }

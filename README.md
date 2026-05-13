@@ -70,7 +70,7 @@ Machine-readable output for support tickets:
 rayclaw doctor --json
 ```
 
-Checks include PATH, shell runtime, Node/npm, `agent-browser`, and MCP command dependencies from `rayclaw.data/mcp.json`.
+Checks include PATH, shell runtime, Node/npm, `rayclaw-browser`, and MCP command dependencies from `rayclaw.data/mcp.json`.
 
 ### Uninstall (script)
 
