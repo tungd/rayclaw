@@ -58,7 +58,7 @@ fn browser_binary_path() -> PathBuf {
 }
 
 fn default_timeout_secs() -> u64 {
-    120
+    600
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +93,10 @@ impl BrowserSession {
 
         let mut cmd = Command::new(&binary);
         cmd.arg("--session").arg(session_id);
+        cmd.env(
+            "RAYCLAW_BROWSER_TASK_TIMEOUT_SECS",
+            timeout_secs.to_string(),
+        );
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -431,7 +435,7 @@ impl Tool for BrowserSubagentTool {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 120)"
+                        "description": "Timeout in seconds (default: 600)"
                     }
                 }),
                 &["task"],
