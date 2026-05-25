@@ -325,7 +325,10 @@ impl ToolRegistry {
             Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
             Box::new(memory::WriteMemoryTool::new(&config.data_dir, db.clone())),
             Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool::new(config.brave_api_key.clone(), config.exa_api_key.clone())),
+            Box::new(web_search::WebSearchTool::new(
+                config.brave_api_key.clone(),
+                config.exa_api_key.clone(),
+            )),
             Box::new(send_message::SendMessageTool::new(
                 channel_registry.clone(),
                 db.clone(),
@@ -428,7 +431,10 @@ impl ToolRegistry {
             Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
             Box::new(memory::WriteMemoryTool::new(&config.data_dir, db.clone())),
             Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool::new(config.brave_api_key.clone(), config.exa_api_key.clone())),
+            Box::new(web_search::WebSearchTool::new(
+                config.brave_api_key.clone(),
+                config.exa_api_key.clone(),
+            )),
             Box::new(export_chat::ExportChatTool::new(
                 db.clone(),
                 &config.data_dir,
@@ -498,7 +504,10 @@ impl ToolRegistry {
             )),
             Box::new(memory::ReadMemoryTool::new(&config.data_dir)),
             Box::new(web_fetch::WebFetchTool),
-            Box::new(web_search::WebSearchTool::new(config.brave_api_key.clone(), config.exa_api_key.clone())),
+            Box::new(web_search::WebSearchTool::new(
+                config.brave_api_key.clone(),
+                config.exa_api_key.clone(),
+            )),
             Box::new(activate_skill::ActivateSkillTool::new(&skills_data_dir)),
             Box::new(structured_memory::StructuredMemorySearchTool::new(db)),
         ];

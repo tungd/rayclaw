@@ -4,7 +4,9 @@ use tracing::{info, warn};
 
 use crate::db::{call_blocking, Database, StoredMessage};
 use crate::embedding::EmbeddingProvider;
-use crate::llm_types::{ContentBlock, ImageSource, Message, MessageContent, ResponseContentBlock};
+use crate::llm_types::{
+    ContentBlock, ImageSource, Message, MessageContent, MessagesResponse, ResponseContentBlock,
+};
 use crate::memory_quality;
 use crate::metrics::{self, SessionMetrics};
 use crate::runtime::AppState;
@@ -1197,9 +1199,15 @@ pub(crate) async fn process_with_agent_impl(
                         }
                     }
 
+                    let content = if result.content.trim().is_empty() {
+                        "(empty tool output)".to_string()
+                    } else {
+                        result.content
+                    };
+
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: result.content,
+                        content,
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
@@ -1226,12 +1234,46 @@ pub(crate) async fn process_with_agent_impl(
                     iteration + 1,
                     chat_id
                 );
-                // Append tool results so the session stays valid, then force stop.
+                // Append tool results so the session stays valid, then try to
+                // salvage a final answer from the gathered context without
+                // exposing tools again.
                 messages.push(Message {
                     role: "user".into(),
                     content: MessageContent::Blocks(tool_results),
                 });
-                let loop_msg = "I detected a repeating pattern in my tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps.".to_string();
+
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "[runtime_guard]: You are repeating tool calls. Stop using tools now. Use the tool results already shown to answer the user's request concisely. If the results are insufficient, say exactly what is missing."
+                            .to_string(),
+                    ),
+                });
+
+                let loop_msg = match state
+                    .llm
+                    .send_message(&system_prompt, messages.clone(), None)
+                    .await
+                {
+                    Ok(final_response) => {
+                        let text = response_text(&final_response);
+                        let display_text = if state.config.show_thinking {
+                            text.clone()
+                        } else {
+                            strip_thinking(&text)
+                        };
+                        if display_text.trim().is_empty() {
+                            loop_results_fallback(&messages)
+                        } else {
+                            display_text
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Loop finalization failed for chat_id={chat_id}: {e}");
+                        loop_results_fallback(&messages)
+                    }
+                };
+
                 messages.push(Message {
                     role: "assistant".into(),
                     content: MessageContent::Text(loop_msg.clone()),
@@ -1762,6 +1804,60 @@ pub(crate) fn strip_thinking(text: &str) -> String {
     result.trim().to_string()
 }
 
+fn response_text(response: &MessagesResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ResponseContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn loop_results_fallback(messages: &[Message]) -> String {
+    let mut excerpts = Vec::new();
+
+    for msg in messages.iter().rev() {
+        let MessageContent::Blocks(blocks) = &msg.content else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            let ContentBlock::ToolResult { content, .. } = block else {
+                continue;
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() || trimmed.starts_with("Todo list updated") {
+                continue;
+            }
+            let excerpt = if trimmed.chars().count() > 1400 {
+                let clipped = trimmed.chars().take(1400).collect::<String>();
+                format!("{clipped}...")
+            } else {
+                trimmed.to_string()
+            };
+            excerpts.push(excerpt);
+            if excerpts.len() >= 2 {
+                break;
+            }
+        }
+        if excerpts.len() >= 2 {
+            break;
+        }
+    }
+
+    if excerpts.is_empty() {
+        return "I detected a repeating pattern in my tool calls and stopped to avoid an infinite loop. Please try rephrasing your request or breaking it into smaller steps.".to_string();
+    }
+
+    excerpts.reverse();
+    format!(
+        "I stopped repeated tool calls, but I did find these relevant results:\n\n{}",
+        excerpts.join("\n\n---\n\n")
+    )
+}
+
 /// Extract text content from a Message for summarization/display.
 pub(crate) fn message_to_text(msg: &Message) -> String {
     match &msg.content {
@@ -1942,7 +2038,52 @@ async fn compact_messages(
         return messages.to_vec();
     }
 
-    let split_at = total - keep_recent;
+    let mut split_at = total - keep_recent;
+
+    // Prevent splitting tool call/result pairs during compaction.
+    // Adjust split_at backwards dynamically to avoid severing a ToolUse and ToolResult pair.
+    loop {
+        let mut recent_tool_results = std::collections::HashSet::new();
+        for msg in &messages[split_at..] {
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                for b in blocks {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                        recent_tool_results.insert(tool_use_id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut missing_tool_use = false;
+        for msg in &messages[..split_at] {
+            if msg.role == "assistant" {
+                if let MessageContent::Blocks(blocks) = &msg.content {
+                    for b in blocks {
+                        if let ContentBlock::ToolUse { id, .. } = b {
+                            if recent_tool_results.contains(id.as_str()) {
+                                missing_tool_use = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if missing_tool_use {
+                break;
+            }
+        }
+
+        if missing_tool_use && split_at > 0 {
+            split_at -= 1;
+        } else {
+            break;
+        }
+    }
+
+    if split_at == 0 {
+        return messages.to_vec();
+    }
+
     let old_messages = &messages[..split_at];
     let recent_messages = &messages[split_at..];
 
@@ -2019,34 +2160,43 @@ async fn compact_messages(
         }
     };
 
-    // Build compacted message list: summary context + recent messages
-    let mut compacted = vec![
-        Message {
-            role: "user".into(),
-            content: MessageContent::Text(format!("[Conversation Summary]\n{summary}")),
-        },
-        Message {
+    // Build compacted message list: summary context + optional assistant ack.
+    // If the first recent message is assistant, we don't need the dummy assistant message
+    // because summary (user) + recent_messages[0] (assistant) alternates perfectly.
+    let mut compacted = vec![Message {
+        role: "user".into(),
+        content: MessageContent::Text(format!("[Conversation Summary]\n{summary}")),
+    }];
+
+    let first_is_assistant = recent_messages
+        .first()
+        .map(|m| m.role == "assistant")
+        .unwrap_or(false);
+
+    if !first_is_assistant {
+        compacted.push(Message {
             role: "assistant".into(),
             content: MessageContent::Text(
                 "Understood, I have the conversation context. How can I help?".into(),
             ),
-        },
-    ];
+        });
+    }
 
     // Append recent messages, fixing role alternation
     for msg in recent_messages {
-        if let Some(last) = compacted.last() {
-            if last.role == msg.role {
-                // Merge with previous to maintain alternation
-                if let Some(last_mut) = compacted.last_mut() {
-                    let existing = message_to_text(last_mut);
-                    let new_text = message_to_text(msg);
-                    last_mut.content = MessageContent::Text(format!("{existing}\n{new_text}"));
-                }
-                continue;
+        let should_merge = compacted
+            .last()
+            .map(|last| last.role == msg.role)
+            .unwrap_or(false);
+
+        if should_merge {
+            // Merge with previous to maintain alternation using block-preserving merge
+            if let Some(last_mut) = compacted.last_mut() {
+                crate::llm::merge_message_content(last_mut, msg.clone());
             }
+        } else {
+            compacted.push(msg.clone());
         }
-        compacted.push(msg.clone());
     }
 
     // Ensure last message is from user
@@ -2068,7 +2218,8 @@ mod tests {
     use crate::error::RayClawError;
     use crate::llm::LlmProvider;
     use crate::llm_types::{
-        Message, MessageContent, MessagesResponse, ResponseContentBlock, ToolDefinition,
+        ContentBlock, Message, MessageContent, MessagesResponse, ResponseContentBlock,
+        ToolDefinition,
     };
     use crate::memory::MemoryManager;
     use crate::runtime::AppState;
@@ -2959,5 +3110,91 @@ mod tests {
         };
         let err = classified.into_error();
         assert!(matches!(err, RayClawError::LlmApi(_)));
+    }
+
+    #[tokio::test]
+    async fn test_compact_messages_prevents_tool_splitting() {
+        let (_db, base_dir) = test_db();
+        let state = test_state_with_llm(&base_dir, Box::new(DummyLlm));
+
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("initial request".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tool_123".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_123".into(),
+                    content: "file1.txt".into(),
+                    is_error: None,
+                }]),
+            },
+        ];
+
+        let compacted = super::compact_messages(&state, "test", 4, &messages, 1).await;
+        assert_eq!(compacted.len(), 3);
+
+        let has_tool_use = compacted.iter().any(|m| {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            } else {
+                false
+            }
+        });
+        assert!(has_tool_use, "Expected tool use to be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_compact_messages_preserves_role_alternation_blocks() {
+        let (_db, base_dir) = test_db();
+        let state = test_state_with_llm(&base_dir, Box::new(DummyLlm));
+
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("summarize this".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "tool_abc".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "pwd"}),
+                }]),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_abc".into(),
+                    content: "/home/user".into(),
+                    is_error: None,
+                }]),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("done".into()),
+            },
+        ];
+
+        let compacted = super::compact_messages(&state, "test", 4, &messages, 3).await;
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(compacted[0].role, "user");
+        assert_eq!(compacted[1].role, "assistant");
+        if let MessageContent::Blocks(blocks) = &compacted[1].content {
+            assert!(matches!(blocks[0], ContentBlock::ToolUse { .. }));
+        } else {
+            panic!("Expected ContentBlock::ToolUse to be preserved as Blocks");
+        }
     }
 }

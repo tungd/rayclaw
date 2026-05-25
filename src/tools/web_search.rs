@@ -141,9 +141,13 @@ async fn search_exa(query: &str, api_key: &str, num_results: usize) -> Result<St
 
     if let Some(results) = val.get("results").and_then(|r| r.as_array()) {
         for (i, item) in results.iter().enumerate() {
-            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+            let title = item
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
             let url = item.get("url").and_then(|u| u.as_str()).unwrap_or_default();
-            let highlights = item.get("highlights")
+            let highlights = item
+                .get("highlights")
                 .and_then(|h| h.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -168,9 +172,8 @@ async fn search_exa(query: &str, api_key: &str, num_results: usize) -> Result<St
 
 async fn search_brave(query: &str, api_key: &str, num_results: usize) -> Result<String, String> {
     let encoded = urlencoding::encode(query);
-    let url = format!(
-        "https://api.search.brave.com/res/v1/web/search?q={encoded}&count={num_results}"
-    );
+    let url =
+        format!("https://api.search.brave.com/res/v1/web/search?q={encoded}&count={num_results}");
 
     let resp = http_client()
         .get(&url)
@@ -187,11 +190,21 @@ async fn search_brave(query: &str, api_key: &str, num_results: usize) -> Result<
     let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let mut output = String::new();
 
-    if let Some(results) = val.get("web").and_then(|w| w.get("results")).and_then(|r| r.as_array()) {
+    if let Some(results) = val
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array())
+    {
         for (i, item) in results.iter().enumerate() {
-            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+            let title = item
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
             let url = item.get("url").and_then(|u| u.as_str()).unwrap_or_default();
-            let description = item.get("description").and_then(|d| d.as_str()).unwrap_or_default();
+            let description = item
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
 
             output.push_str(&format!(
                 "{}. {}\n   {}\n   {}\n\n",
@@ -223,7 +236,8 @@ async fn search_ddg(query: &str, num_results: usize) -> Result<String, String> {
     let body = resp.text().await.map_err(|e| e.to_string())?;
 
     // Robust CAPTCHA and Rate-limiting detection
-    if body.contains("anomaly-modal") || body.contains("challenge-form") || body.contains("captcha") {
+    if body.contains("anomaly-modal") || body.contains("challenge-form") || body.contains("captcha")
+    {
         return Err("Search blocked: CAPTCHA or unusual traffic verification required by DuckDuckGo. Consider configuring a Brave Search API key.".to_string());
     }
 
@@ -254,7 +268,11 @@ mod tests {
         assert_eq!(tool.name(), "web_search");
         let def = tool.definition();
         assert_eq!(def.name, "web_search");
-        assert!(def.description.contains("Exa") || def.description.contains("Brave Search") || def.description.contains("DuckDuckGo"));
+        assert!(
+            def.description.contains("Exa")
+                || def.description.contains("Brave Search")
+                || def.description.contains("DuckDuckGo")
+        );
         assert!(def.input_schema["properties"]["query"].is_object());
         let required = def.input_schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "query"));

@@ -331,6 +331,7 @@ async fn handle_message(
         chat_id: msg.chat.id,
         thread_id: msg.thread_id,
     };
+    let tg_config = telegram_runtime_config(&state);
     let (runtime_chat_type, db_chat_type) = match msg.chat.kind {
         teloxide::types::ChatKind::Private(_) => ("private", "telegram_private"),
         teloxide::types::ChatKind::Public(teloxide::types::ChatPublic {
@@ -617,8 +618,8 @@ async fn handle_message(
 
     // Check group allowlist
     if (db_chat_type == "telegram_group" || db_chat_type == "telegram_supergroup")
-        && !state.config.allowed_groups.is_empty()
-        && !state.config.allowed_groups.contains(&raw_chat_id)
+        && !tg_config.allowed_groups.is_empty()
+        && !tg_config.allowed_groups.contains(&raw_chat_id)
     {
         let external_chat_id =
             format_telegram_external_chat_id(raw_chat_id, conversation_thread_id);
@@ -722,7 +723,6 @@ async fn handle_message(
     let _ = call_blocking(state.db.clone(), move |db| db.store_message(&stored)).await;
 
     // Determine if we should respond
-    let tg_config = telegram_runtime_config(&state);
     let should_respond = match runtime_chat_type {
         "private" => true,
         _ => should_respond_in_telegram_group(&text, &tg_config),
@@ -1822,5 +1822,24 @@ mod tests {
         };
         assert!(should_respond_in_telegram_group("hi @raybot", &config));
         assert!(!should_respond_in_telegram_group("hi there", &config));
+    }
+
+    #[test]
+    fn test_telegram_config_supports_respond_to_all_messages() {
+        let cfg: TelegramChannelConfig = serde_yaml::from_str(
+            r#"
+bot_token: tok
+bot_username: td_rayclawbot
+allowed_groups:
+  - -1003910870189
+respond_to_all_messages: true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.bot_token, "tok");
+        assert_eq!(cfg.bot_username, "td_rayclawbot");
+        assert_eq!(cfg.allowed_groups, vec![-1003910870189]);
+        assert!(cfg.respond_to_all_messages);
     }
 }

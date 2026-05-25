@@ -31,7 +31,7 @@ fn content_to_blocks(content: MessageContent) -> Vec<ContentBlock> {
 
 /// Merge `other` into `prev` (same role).  Both are converted to block form
 /// so that tool_result blocks, text, and images are preserved.
-fn merge_message_content(prev: &mut Message, other: Message) {
+pub(crate) fn merge_message_content(prev: &mut Message, other: Message) {
     let mut blocks = content_to_blocks(std::mem::replace(
         &mut prev.content,
         MessageContent::Text(String::new()),
