@@ -2210,6 +2210,8 @@ mod tests {
 
     fn test_state(llm: Box<dyn LlmProvider>) -> Arc<AppState> {
         let mut cfg = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "anthropic".into(),

@@ -2154,6 +2154,8 @@ mod tests {
         let runtime_dir = base_dir.join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let mut cfg = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "anthropic".into(),
@@ -2501,6 +2503,8 @@ mod tests {
         std::fs::write(&soul_path, "I am a wise owl assistant.").unwrap();
 
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             data_dir: base_dir.to_string_lossy().to_string(),
             aws_region: None,
             aws_access_key_id: None,
@@ -2571,6 +2575,8 @@ mod tests {
         std::fs::write(&soul_file, "I am a custom personality.").unwrap();
 
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             data_dir: base_dir.to_string_lossy().to_string(),
             soul_path: Some(soul_file.to_string_lossy().to_string()),
             telegram_bot_token: "tok".into(),

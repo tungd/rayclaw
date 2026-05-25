@@ -2186,6 +2186,8 @@ mod tests {
     #[test]
     fn test_create_provider_anthropic() {
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "anthropic".into(),
@@ -2246,6 +2248,8 @@ mod tests {
     #[test]
     fn test_create_provider_openai() {
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "openai".into(),
@@ -2371,6 +2375,8 @@ mod tests {
         });
 
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "openai-codex".into(),
@@ -2535,6 +2541,8 @@ mod tests {
         });
 
         let config = Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "openai-codex".into(),

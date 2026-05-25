@@ -161,6 +161,10 @@ pub struct Config {
     pub compact_keep_recent: usize,
     #[serde(default)]
     pub show_thinking: bool,
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
+    #[serde(default)]
+    pub exa_api_key: Option<String>,
 
     // --- Paths & environment ---
     #[serde(default = "default_data_dir")]
@@ -492,6 +496,22 @@ impl Config {
     pub(crate) fn post_deserialize(&mut self) -> Result<(), RayClawError> {
         self.normalize_fields()?;
 
+        if self.brave_api_key.is_none() {
+            if let Ok(key) = std::env::var("BRAVE_API_KEY") {
+                if !key.trim().is_empty() {
+                    self.brave_api_key = Some(key.trim().to_string());
+                }
+            }
+        }
+
+        if self.exa_api_key.is_none() {
+            if let Ok(key) = std::env::var("EXA_API_KEY") {
+                if !key.trim().is_empty() {
+                    self.exa_api_key = Some(key.trim().to_string());
+                }
+            }
+        }
+
         // Synthesize `channels` map from legacy flat fields if empty
         if self.channels.is_empty() {
             if !self.telegram_bot_token.trim().is_empty() {
@@ -609,6 +629,8 @@ mod tests {
 
     pub fn test_config() -> Config {
         Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "anthropic".into(),

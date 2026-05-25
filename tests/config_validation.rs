@@ -5,6 +5,8 @@ use rayclaw::config::{Config, WorkingDirIsolation};
 /// Helper to create a minimal valid config for testing.
 fn minimal_config() -> Config {
     Config {
+        brave_api_key: None,
+        exa_api_key: None,
         telegram_bot_token: "tok".into(),
         bot_username: "testbot".into(),
         llm_provider: "anthropic".into(),

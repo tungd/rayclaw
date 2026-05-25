@@ -35,6 +35,8 @@ fn temp_db() -> (Arc<Database>, String) {
 /// Minimal valid Config for building a ToolRegistry in tests.
 fn minimal_config() -> Config {
     Config {
+        brave_api_key: None,
+        exa_api_key: None,
         telegram_bot_token: "tok".into(),
         bot_username: "testbot".into(),
         llm_provider: "anthropic".into(),

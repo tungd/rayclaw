@@ -215,6 +215,8 @@ mod tests {
 
     fn base_config() -> Config {
         Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             llm_provider: "anthropic".into(),

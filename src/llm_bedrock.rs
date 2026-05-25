@@ -1343,6 +1343,8 @@ mod tests {
     #[test]
     fn test_credentials_resolve_from_config() {
         let mut config = crate::config::Config {
+            brave_api_key: None,
+            exa_api_key: None,
             telegram_bot_token: "tok".into(),
             bot_username: "bot".into(),
             api_key: String::new(),
